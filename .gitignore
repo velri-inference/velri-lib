@@ -1,0 +1,5 @@
+/build/
+/build-*/
+/install/
+/docs/benchmarks/
+__pycache__/

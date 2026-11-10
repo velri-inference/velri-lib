@@ -1,0 +1,51 @@
+name: CPU kernel contract
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - compiler: clang-18
+            sanitize: "OFF"
+            multiversion: "ON"
+          - compiler: gcc-14
+            sanitize: "OFF"
+            multiversion: "ON"
+          - compiler: gcc-14
+            sanitize: "ON"
+            multiversion: "ON"
+          - compiler: clang-18
+            sanitize: "OFF"
+            multiversion: "OFF"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install C23 compiler
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.compiler }}
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DVELRI_SANITIZE=${{ matrix.sanitize }}
+          -DVELRI_CPU_MULTIVERSION=${{ matrix.multiversion }}
+          -DVELRI_BUILD_BENCHMARK=ON
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
+      - name: Checked benchmark smoke test
+        run: ./build/bench_linear auto 3 33 17 1 3
+  aarch64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y
+          gcc-14-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
