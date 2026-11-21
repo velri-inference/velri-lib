@@ -1,0 +1,396 @@
+// Vulkan Elementwise kernels: Activations, GatedMLP, Axpby, Mul, Softmax, FWHT, QuantizeRow.
+import numeric;
+import activations;
+import reductions;
+import vk_common;
+
+struct ActivationArgs {
+    Ptr<float, Access.Read> x;
+    Ptr<float> y;
+    uint count;
+    uint pad;
+};
+
+void activation_gpu_impl<A : IActivation>(ActivationArgs a, uint tid) {
+    uint base = tid << 2u;
+    if (base + 4u <= a.count && is_ptr_aligned16(a.x) && is_ptr_aligned16(a.y)) {
+        float4 v = load_a16(Ptr<float4, Access.Read>(a.x) + tid);
+        store_a16(Ptr<float4>(a.y) + tid, apply_act4<A>(v));
+    } else {
+        uint end = min(base + 4u, a.count);
+        for (uint i = base; i < end; ++i) a.y[i] = A::apply(a.x[i]);
+    }
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_activation_silu_f32(uniform ActivationArgs a, uint3 tid : SV_DispatchThreadID) {
+    activation_gpu_impl<ActSiLU>(a, tid.x);
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_activation_gelu_f32(uniform ActivationArgs a, uint3 tid : SV_DispatchThreadID) {
+    activation_gpu_impl<ActGeluTanh>(a, tid.x);
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_activation_relu2_f32(uniform ActivationArgs a, uint3 tid : SV_DispatchThreadID) {
+    activation_gpu_impl<ActReLU2>(a, tid.x);
+}
+
+struct GatedMlpArgs {
+    Ptr<float, Access.Read> gate;
+    Ptr<float, Access.Read> up;
+    Ptr<float> y;
+    uint count;
+    float clamp_limit;
+};
+
+void gated_mlp_gpu_impl<A : IActivation>(GatedMlpArgs a, uint tid) {
+    uint base = tid << 2u;
+    if (base + 4u <= a.count && is_ptr_aligned16(a.gate) &&
+        is_ptr_aligned16(a.up) && is_ptr_aligned16(a.y)) {
+        float4 g = apply_clamp4(load_a16(Ptr<float4, Access.Read>(a.gate) + tid), a.clamp_limit);
+        float4 u = apply_clamp4(load_a16(Ptr<float4, Access.Read>(a.up) + tid), a.clamp_limit);
+        store_a16(Ptr<float4>(a.y) + tid, apply_act4<A>(g) * u);
+    } else {
+        uint end = min(base + 4u, a.count);
+        for (uint i = base; i < end; ++i) {
+            float g = apply_symmetric_clamp(a.gate[i], a.clamp_limit);
+            float u = apply_symmetric_clamp(a.up[i], a.clamp_limit);
+            a.y[i] = A::apply(g) * u;
+        }
+    }
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_gated_silu_f32(uniform GatedMlpArgs a, uint3 tid : SV_DispatchThreadID) {
+    gated_mlp_gpu_impl<ActSiLU>(a, tid.x);
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_gated_gelu_f32(uniform GatedMlpArgs a, uint3 tid : SV_DispatchThreadID) {
+    gated_mlp_gpu_impl<ActGeluTanh>(a, tid.x);
+}
+
+struct VecAxpbyArgs {
+    Ptr<float, Access.Read> a;
+    Ptr<float, Access.Read> b;
+    Ptr<float> y;
+    uint count;
+    float alpha;
+    float beta;
+    uint has_b;
+    uint pad;
+};
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_vec_axpby_f32(uniform VecAxpbyArgs p, uint3 tid : SV_DispatchThreadID) {
+    uint base = tid.x << 2u;
+    bool aligned = is_ptr_aligned16(p.a) && is_ptr_aligned16(p.y) &&
+                   ((p.has_b == 0u) || is_ptr_aligned16(p.b));
+    if (base + 4u <= p.count && aligned) {
+        float4 outv = float4(p.alpha) * load_a16(Ptr<float4, Access.Read>(p.a) + tid.x);
+        if (p.has_b != 0u) outv = fma(float4(p.beta), load_a16(Ptr<float4, Access.Read>(p.b) + tid.x), outv);
+        store_a16(Ptr<float4>(p.y) + tid.x, outv);
+    } else {
+        uint end = min(base + 4u, p.count);
+        for (uint i = base; i < end; ++i) {
+            float v = p.alpha * p.a[i];
+            if (p.has_b != 0u) v = fma(p.beta, p.b[i], v);
+            p.y[i] = v;
+        }
+    }
+}
+
+struct VecMulArgs {
+    Ptr<float, Access.Read> a;
+    Ptr<float, Access.Read> b;
+    Ptr<float> y;
+    uint count;
+    uint pad;
+};
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_vec_mul_f32(uniform VecMulArgs p, uint3 tid : SV_DispatchThreadID) {
+    uint base = tid.x << 2u;
+    if (base + 4u <= p.count && is_ptr_aligned16(p.a) &&
+        is_ptr_aligned16(p.b) && is_ptr_aligned16(p.y)) {
+        float4 av = load_a16(Ptr<float4, Access.Read>(p.a) + tid.x);
+        float4 bv = load_a16(Ptr<float4, Access.Read>(p.b) + tid.x);
+        store_a16(Ptr<float4>(p.y) + tid.x, av * bv);
+    } else {
+        uint end = min(base + 4u, p.count);
+        for (uint i = base; i < end; ++i) p.y[i] = p.a[i] * p.b[i];
+    }
+}
+
+struct SoftmaxArgs {
+    Ptr<float, Access.Read> x;
+    Ptr<float> y;
+    uint rows;
+    uint cols;
+    uint x_stride;
+    uint y_stride;
+};
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    uint row = gid.x;
+    uint tid = gtid.x;
+    if (row >= a.rows) return;
+    Ptr<float, Access.Read> xr = a.x + uint64_t(row) * uint64_t(a.x_stride);
+    Ptr<float> yr = a.y + uint64_t(row) * uint64_t(a.y_stride);
+    static const float kNegInfInit = -3.4028234e38f;
+    static const float kNegInfCutoff = -3.4e38f;
+
+    bool aligned = ((a.cols & 3u) == 0u) && is_ptr_aligned16(xr) && is_ptr_aligned16(yr);
+    if (aligned && a.cols <= 4096u) {
+        uint n4 = a.cols >> 2u;
+        Ptr<float4, Access.Read> xr4 = Ptr<float4, Access.Read>(xr);
+        Ptr<float4> yr4 = Ptr<float4>(yr);
+
+        float4 reg[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+        float local_max = kNegInfInit;
+        [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+            uint idx = s * 256u + tid;
+            if (idx < n4) {
+                float4 v = load_a16(xr4 + idx);
+                reg[s] = v;
+                local_max = max(local_max, max(max(v.x, v.y), max(v.z, v.w)));
+            }
+        }
+        float row_max = wg_reduce_max(local_max, tid, 256u);
+        if (!(row_max > kNegInfCutoff)) {
+            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+                uint idx = s * 256u + tid;
+                if (idx < n4) store_a16(yr4 + idx, float4(0.0f));
+            }
+            return;
+        }
+
+        float local_sum = 0.0f;
+        [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+            uint idx = s * 256u + tid;
+            if (idx < n4) {
+                float4 v = reg[s];
+                float4 e = float4(
+                    (v.x > kNegInfCutoff) ? fast_expf(v.x - row_max) : 0.0f,
+                    (v.y > kNegInfCutoff) ? fast_expf(v.y - row_max) : 0.0f,
+                    (v.z > kNegInfCutoff) ? fast_expf(v.z - row_max) : 0.0f,
+                    (v.w > kNegInfCutoff) ? fast_expf(v.w - row_max) : 0.0f);
+                reg[s] = e;
+                local_sum += e.x + e.y + e.z + e.w;
+            }
+        }
+        float total_sum = wg_reduce_sum(local_sum, tid, 256u);
+        float inv_sum = (total_sum > 0.0f) ? (1.0f / total_sum) : 0.0f;
+
+        [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+            uint idx = s * 256u + tid;
+            if (idx < n4) store_a16(yr4 + idx, reg[s] * inv_sum);
+        }
+        return;
+    }
+
+    float local_max = kNegInfInit;
+    for (uint c = tid; c < a.cols; c += 256u) {
+        local_max = max(local_max, xr[c]);
+    }
+    float row_max = wg_reduce_max(local_max, tid, 256u);
+    if (!(row_max > kNegInfCutoff)) {
+        for (uint c = tid; c < a.cols; c += 256u) yr[c] = 0.0f;
+        return;
+    }
+
+    float local_sum = 0.0f;
+    for (uint c = tid; c < a.cols; c += 256u) {
+        float v = xr[c];
+        float e = (v > kNegInfCutoff) ? fast_expf(v - row_max) : 0.0f;
+        yr[c] = e;
+        local_sum += e;
+    }
+    float total_sum = wg_reduce_sum(local_sum, tid, 256u);
+    float inv_sum = (total_sum > 0.0f) ? (1.0f / total_sum) : 0.0f;
+    for (uint c = tid; c < a.cols; c += 256u) {
+        yr[c] *= inv_sum;
+    }
+}
+
+// ============================================================================
+// Normalized FWHT (subgroup-size agnostic: works on SIMD8/16, Wave32, Wave64)
+// ============================================================================
+struct FwhtArgs {
+    Ptr<float, Access.Read> x;
+    Ptr<uint8_t, Access.Read> suh;
+    Ptr<float> y;
+    uint rows;
+    uint cols;
+    uint block_size;
+    uint x_stride;
+    uint y_stride;
+    uint suh_mode; // 0=none, 1=f32, 2=f16
+    float inv_sqrt_b;
+    uint pad;
+};
+
+groupshared float4 s_fwht[256];
+
+float4 fwht_stage(float4 v, uint tid, uint lane, uint lane_cnt, uint bit) {
+    if (bit < lane_cnt) {
+        float4 p = WaveReadLaneAt(v, lane ^ bit);
+        return ((lane & bit) == 0u) ? (v + p) : (p - v);
+    }
+    s_fwht[tid] = v;
+    GroupMemoryBarrierWithGroupSync();
+    float4 p = s_fwht[tid ^ bit];
+    GroupMemoryBarrierWithGroupSync();
+    return ((tid & bit) == 0u) ? (v + p) : (p - v);
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_fwht_f32(uniform FwhtArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    uint row = gid.y;
+    uint tid = gtid.x;
+    if (row >= a.rows) return;
+    uint elem0 = gid.x * 1024u + tid * 4u;
+    Ptr<float, Access.Read> xr = a.x + uint64_t(row) * uint64_t(a.x_stride);
+    Ptr<float> yr = a.y + uint64_t(row) * uint64_t(a.y_stride);
+
+    float4 v = float4(0.0f);
+    bool active = (elem0 < a.cols);
+    if (active) {
+        if (is_ptr_aligned16(xr)) {
+            v = load_a16(Ptr<float4, Access.Read>(xr + elem0));
+        } else {
+            v = float4(xr[elem0 + 0u], xr[elem0 + 1u], xr[elem0 + 2u], xr[elem0 + 3u]);
+        }
+        if (a.suh_mode == 1u) {
+            Ptr<float, Access.Read> sf = Ptr<float, Access.Read>(a.suh);
+            float4 sv = is_ptr_aligned16(sf) ? load_a16(Ptr<float4, Access.Read>(sf + elem0))
+                                             : float4(sf[elem0], sf[elem0 + 1u], sf[elem0 + 2u], sf[elem0 + 3u]);
+            v *= sv;
+        } else if (a.suh_mode == 2u) {
+            Ptr<half, Access.Read> sh = Ptr<half, Access.Read>(a.suh);
+            v *= float4(float(sh[elem0]), float(sh[elem0 + 1u]), float(sh[elem0 + 2u]), float(sh[elem0 + 3u]));
+        }
+        float a0 = v.x + v.y, a1 = v.x - v.y;
+        float a2 = v.z + v.w, a3 = v.z - v.w;
+        v = float4(a0 + a2, a1 + a3, a0 - a2, a1 - a3);
+    }
+
+    uint lane = WaveGetLaneIndex();
+    uint lane_cnt = WaveGetLaneCount();
+    v = fwht_stage(v, tid, lane, lane_cnt, 1u);
+    v = fwht_stage(v, tid, lane, lane_cnt, 2u);
+    if (a.block_size >= 32u)  v = fwht_stage(v, tid, lane, lane_cnt, 4u);
+    if (a.block_size >= 64u)  v = fwht_stage(v, tid, lane, lane_cnt, 8u);
+    if (a.block_size >= 128u) v = fwht_stage(v, tid, lane, lane_cnt, 16u);
+    if (a.block_size >= 256u) v = fwht_stage(v, tid, lane, lane_cnt, 32u);
+
+    if (active) {
+        v *= a.inv_sqrt_b;
+        if (is_ptr_aligned16(yr)) {
+            store_a16(Ptr<float4>(yr + elem0), v);
+        } else {
+            yr[elem0 + 0u] = v.x; yr[elem0 + 1u] = v.y;
+            yr[elem0 + 2u] = v.z; yr[elem0 + 3u] = v.w;
+        }
+    }
+}
+
+// ============================================================================
+// Parallel Dynamic Symmetric Row Quantization (F32 -> I8)
+// ============================================================================
+struct QuantizeRowArgs {
+    Ptr<float, Access.Read> x;
+    Ptr<int8_t> x_i8;
+    Ptr<float> scale_out;
+    uint rows;
+    uint k;
+    uint x_stride;
+    uint xi8_stride;
+};
+
+uint pack_i8x4_scaled(float4 scaled) {
+    float4 s = clamp(round(scaled), float4(-127.0f), float4(127.0f));
+    uint b0 = uint(int32_t(s.x)) & 0xFFu;
+    uint b1 = uint(int32_t(s.y)) & 0xFFu;
+    uint b2 = uint(int32_t(s.z)) & 0xFFu;
+    uint b3 = uint(int32_t(s.w)) & 0xFFu;
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    uint row = gid.x;
+    uint tid = gtid.x;
+    if (row >= a.rows) return;
+    Ptr<float, Access.Read> xr = a.x + uint64_t(row) * uint64_t(a.x_stride);
+    Ptr<int8_t> qr = a.x_i8 + uint64_t(row) * uint64_t(a.xi8_stride);
+
+    bool aligned = ((a.k & 3u) == 0u) && is_ptr_aligned16(xr) && is_ptr_aligned4(qr);
+    if (aligned && a.k <= 4096u) {
+        uint n4 = a.k >> 2u;
+        Ptr<float4, Access.Read> xr4 = Ptr<float4, Access.Read>(xr);
+        Ptr<uint> qr4 = Ptr<uint>(qr);
+
+        float4 reg[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+        float local_max = 0.0f;
+        [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+            uint idx = s * 256u + tid;
+            if (idx < n4) {
+                float4 v = load_a16(xr4 + idx);
+                reg[s] = v;
+                float4 av = abs(v);
+                local_max = max(local_max, max(max(av.x, av.y), max(av.z, av.w)));
+            }
+        }
+        float amax = wg_reduce_max(local_max, tid, 256u);
+        if (amax >= 1.0e-35f) {
+            float scale = amax / 127.0f;
+            float inv_scale = 127.0f / amax;
+            if (tid == 0u) a.scale_out[row] = scale;
+            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+                uint idx = s * 256u + tid;
+                if (idx < n4) qr4[idx] = pack_i8x4_scaled(reg[s] * inv_scale);
+            }
+        } else if (amax > 0.0f) {
+            float scale = max(amax / 127.0f, 1.17549435e-38f);
+            if (tid == 0u) a.scale_out[row] = scale;
+            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+                uint idx = s * 256u + tid;
+                if (idx < n4) qr4[idx] = pack_i8x4_scaled(reg[s] / scale);
+            }
+        } else {
+            if (tid == 0u) a.scale_out[row] = 1.0f;
+            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+                uint idx = s * 256u + tid;
+                if (idx < n4) qr4[idx] = 0u;
+            }
+        }
+        return;
+    }
+
+    float local_max = 0.0f;
+    for (uint c = tid; c < a.k; c += 256u) {
+        local_max = max(local_max, abs(xr[c]));
+    }
+    float amax = wg_reduce_max(local_max, tid, 256u);
+    if (amax >= 1.0e-35f) {
+        float scale = amax / 127.0f;
+        float inv_scale = 127.0f / amax;
+        if (tid == 0u) a.scale_out[row] = scale;
+        for (uint c = tid; c < a.k; c += 256u) {
+            qr[c] = int8_t(int32_t(clamp(round(xr[c] * inv_scale), -127.0f, 127.0f)));
+        }
+    } else if (amax > 0.0f) {
+        float scale = max(amax / 127.0f, 1.17549435e-38f);
+        if (tid == 0u) a.scale_out[row] = scale;
+        for (uint c = tid; c < a.k; c += 256u) {
+            qr[c] = int8_t(int32_t(clamp(round(xr[c] / scale), -127.0f, 127.0f)));
+        }
+    } else {
+        if (tid == 0u) a.scale_out[row] = 1.0f;
+        for (uint c = tid; c < a.k; c += 256u) qr[c] = int8_t(0);
+    }
+}

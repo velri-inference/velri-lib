@@ -1,4 +1,11 @@
 @PACKAGE_INIT@
 
+if(NOT WIN32)
+    include(CMakeFindDependencyMacro)
+    find_dependency(Threads)
+endif()
 include("${CMAKE_CURRENT_LIST_DIR}/VelriLibTargets.cmake")
+if(TARGET VelriLib::velri AND NOT TARGET VelriLib::core)
+    add_library(VelriLib::core ALIAS VelriLib::velri)
+endif()
 check_required_components(VelriLib)

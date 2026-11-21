@@ -1,11 +1,13 @@
-name: CPU kernel contract
+name: Velri-lib Slang AOT & contract
 on:
   push:
   pull_request:
 permissions:
   contents: read
+env:
+  SLANG_VERSION: "2026.22.1"
 jobs:
-  native:
+  linux-x64:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -26,26 +28,58 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install C23 compiler
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.compiler }}
+      - name: Install Khronos Slang (slangc AOT)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/slang"
+          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
       - name: Configure
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_C_FLAGS=-Werror
           -DVELRI_SANITIZE=${{ matrix.sanitize }}
           -DVELRI_CPU_MULTIVERSION=${{ matrix.multiversion }}
-          -DVELRI_BUILD_BENCHMARK=ON
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure
-      - name: Checked benchmark smoke test
-        run: ./build/bench_linear auto 3 33 17 1 3
-  aarch64:
+
+  linux-x64-dispatch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-14 qemu-user
+      - name: Install Khronos Slang (slangc AOT)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/slang"
+          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
+      - run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_C_FLAGS=-Werror -DVELRI_CPU_MULTIVERSION=ON
+      - run: cmake --build build --parallel 2
+      - name: Run the same binary on baseline and AVX2-only CPUs
+        run: |
+          qemu-x86_64 -cpu Nehalem ./build/test_kernels
+          qemu-x86_64 -cpu Haswell,-hle,-rtm ./build/test_kernels
+
+  linux-aarch64-cross:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: >-
           sudo apt-get update && sudo apt-get install -y
           gcc-14-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - name: Install Khronos Slang (slangc AOT)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/slang"
+          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
       - run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake
+          -DCMAKE_C_FLAGS=-Werror
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure
