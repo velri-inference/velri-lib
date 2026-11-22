@@ -30,7 +30,7 @@ static bool validate_vtable(const velri_backend_vtable *vt) {
 
 static velri_status register_backend_with_cfg(velri_context *ctx,
                                               const velri_backend_vtable *vtable,
-                                              const void *open_cfg) {
+                                              const void *open_cfg, const velri_device_hooks *hooks) {
     if (!ctx || !validate_vtable(vtable)) {
         return VELRI_ERR_INVALID;
     }
@@ -68,6 +68,7 @@ static velri_status register_backend_with_cfg(velri_context *ctx,
             goto rollback;
         }
         ctx->devices[ctx->num_devices].vt = vtable;
+        ctx->devices[ctx->num_devices].hooks = hooks;
         ctx->devices[ctx->num_devices].dev = dev;
         ctx->devices[ctx->num_devices].caps = caps;
         ctx->num_devices++;
@@ -88,7 +89,7 @@ rollback:
 
 velri_status velri_context_register_backend(velri_context *ctx,
                                             const velri_backend_vtable *vtable) {
-    return register_backend_with_cfg(ctx, vtable, nullptr);
+    return register_backend_with_cfg(ctx, vtable, nullptr, nullptr);
 }
 
 velri_status velri_context_create(const velri_context_config *cfg, velri_context **out_ctx) {
@@ -117,7 +118,7 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
         .use_physical_cores = ctx->cfg.use_physical_cores,
         .reserve_cores = ctx->cfg.cpu_reserve_cores,
     };
-    velri_status st = register_backend_with_cfg(ctx, velri_cpu_backend_vtable(), &cpu_cfg);
+    velri_status st = register_backend_with_cfg(ctx, velri_cpu_backend_vtable(), &cpu_cfg, nullptr);
     if (st != VELRI_OK) {
         velri_context_release(ctx);
         return st;
@@ -125,7 +126,9 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
 
 #ifdef VELRI_CORE_HAS_VULKAN
     if (ctx->cfg.enable_vulkan) {
-        (void)register_backend_with_cfg(ctx, velri_vulkan_backend_vtable(), nullptr);
+        const velri_vk_open_cfg vk_cfg = {.defer_secondary_devices = true};
+        (void)register_backend_with_cfg(ctx, velri_vulkan_backend_vtable(), &vk_cfg,
+                                        &velri_vulkan_device_hooks);
     }
 #endif
 
@@ -155,9 +158,12 @@ void velri_context_release(velri_context *ctx) {
 void velri_context_destroy(velri_context *ctx) { velri_context_release(ctx); }
 
 velri_status velri_device_alloc_tracked(velri_context *ctx, velri_device_id dev_id, size_t bytes,
-                                        size_t align, void **out_handle) {
+                                        size_t align, velri_arena_kind kind, void **out_handle) {
     velri_device_entry *de = &ctx->devices[dev_id];
-    velri_status st = de->vt->alloc(de->dev, bytes, align, out_handle);
+    velri_alloc_fn alloc = (kind == VELRI_ARENA_IO && de->hooks && de->hooks->alloc_io)
+                               ? de->hooks->alloc_io
+                               : de->vt->alloc;
+    velri_status st = alloc(de->dev, bytes, align, out_handle);
     if (st == VELRI_OK) {
         atomic_fetch_add_explicit(&ctx->total_allocs, 1U, memory_order_relaxed);
     }

@@ -130,7 +130,7 @@ velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velr
     if (!validate_attention_common(b, x, spec, &q_dim, &kv_dim, &qkv_dim)) {
         return VELRI_TENSOR_NONE;
     }
-    if (spec->rope.enabled) {
+    if (spec->rope.enabled || spec->f16_kv) {
         velri_b_set_error(b, VELRI_ERR_UNSUPPORTED);
         return VELRI_TENSOR_NONE;
     }
@@ -324,10 +324,11 @@ velri_tensor velri_block_dense_attention(velri_builder *b, velri_tensor x, const
     }
 
     const size_t dim_kv[3] = {spec->n_kv_heads, spec->max_ctx, spec->head_dim};
+    const velri_dtype cache_dtype = spec->f16_kv ? VELRI_DTYPE_F16 : act_dtype;
     velri_tensor k_cache = alloc_cache_state(b, prefix, spec->state_prefix, ".k_cache",
-                                             spec->kv_cache_scope, act_dtype, dim_kv);
+                                             spec->kv_cache_scope, cache_dtype, dim_kv);
     velri_tensor v_cache = alloc_cache_state(b, prefix, spec->state_prefix, ".v_cache",
-                                             spec->kv_cache_scope, act_dtype, dim_kv);
+                                             spec->kv_cache_scope, cache_dtype, dim_kv);
     if (!k_cache.valid || !v_cache.valid) {
         goto cleanup;
     }

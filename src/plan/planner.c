@@ -223,7 +223,7 @@ static velri_status pack_weight_slabs(velri_plan *plan, bool allocate_slabs) {
             for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
                 velri_status st = velri_device_alloc_tracked(
                     ctx, d, plan->weight_slab_bytes[d][s], plan->weight_slab_align[d][s],
-                    &plan->weight_slabs[d][s]);
+                    VELRI_ARENA_WEIGHT, &plan->weight_slabs[d][s]);
                 if (st != VELRI_OK) {
                     return st;
                 }
@@ -1048,6 +1048,37 @@ done:
     return st;
 }
 
+/* All OUTPUT storages of the final device share one packed IO arena.  Include only
+ * their enclosing aligned byte range in the optional per-slot readback allocation. */
+static void plan_output_readback(velri_plan *plan) {
+    if (!plan->num_steps || plan->steps[plan->num_steps - 1U].kind != VELRI_STEP_OP) {
+        return;
+    }
+    velri_device_id d = plan->steps[plan->num_steps - 1U].u.op.device_id;
+    const velri_device_entry *de = &plan->ctx->devices[d];
+    if (!de->vt->capture_graph || !de->hooks || !de->hooks->capture_outputs) {
+        return;
+    }
+    size_t first = SIZE_MAX, end = 0U;
+    for (uint32_t s = 0U; s < plan->num_user_storages; ++s) {
+        const velri_plan_storage *ps = &plan->storages[s];
+        if (ps->device_id == d && ps->arena_kind == VELRI_ARENA_IO &&
+            ps->kind == VELRI_STORAGE_OUTPUT && ps->byte_size > 0U) {
+            if (ps->arena_offset < first) first = ps->arena_offset;
+            size_t last = ps->arena_offset + ps->byte_size; /* Bounded by the packed arena. */
+            if (last > end) end = last;
+        }
+    }
+    if (end > first) {
+        size_t bytes = 0U;
+        if (!velri_align_up_overflow(end - first, de->caps.min_align_bytes, &bytes) &&
+            bytes <= de->hooks->max_readback_bytes &&
+            bytes <= plan->slot_arena_bytes[VELRI_SLOT_ARENA_IO][d] - first) {
+            plan->readback = (velri_io_range){.offset = first, .bytes = bytes};
+        }
+    }
+}
+
 static void compute_memory_report(velri_plan *plan) {
     velri_memory_report *rep = &plan->report;
     memset(rep, 0, sizeof(*rep));
@@ -1087,6 +1118,9 @@ static void compute_memory_report(velri_plan *plan) {
     for (uint32_t d = 0U; d < rep->num_devices; ++d) {
         velri_device_memory_report *dr = &rep->devices[d];
         size_t ovh = 0U;
+        if (plan->readback.bytes && plan->steps[plan->num_steps - 1U].u.op.device_id == d) {
+            ovh = plan->readback.bytes;
+        }
         if (!plan->ctx->devices[d].caps.is_host_memory) {
             if (!plan->weight_owner) {
                 size_t packed_w = 0U;
@@ -1273,6 +1307,7 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
         return st;
     }
 
+    plan_output_readback(plan);
     compute_memory_report(plan);
     *out_plan = plan;
     return VELRI_OK;

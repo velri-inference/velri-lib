@@ -12,11 +12,32 @@ groupshared uint4 s_cm128_b[128u * kCmSmemStrideU4];
 groupshared uint4 s_cm64_a[64u * kCmSmemStrideU4];
 groupshared uint4 s_cm64_b[64u * kCmSmemStrideU4];
 
-uint4 load_u4_safe<let ELEM_BYTES : int>(
+// A tile of eight elements occupies one uint4 after packing. With F32 inputs
+// the global tile is twice as large; conversion happens in registers.
+uint4 load_coop_tile<let PACK_F32 : bool>(Ptr<uint4, Access.Read> base, uint64_t tile) {
+    if (PACK_F32) {
+        Ptr<float4, Access.Read> p = Ptr<float4, Access.Read>(base) + tile * 2u;
+        uint4 a = f32tof16(load_a16(p));
+        uint4 b = f32tof16(load_a16(p + 1u));
+        return uint4(a.x | (a.y << 16u), a.z | (a.w << 16u),
+                     b.x | (b.y << 16u), b.z | (b.w << 16u));
+    }
+    return load_a16(base + tile);
+}
+
+uint4 load_u4_safe<let ELEM_BYTES : int, let PACK_F32 : bool>(
     Ptr<uint8_t, Access.Read> base_b, uint row, uint row_lim,
     uint k_elem, uint k_lim, uint stride_elems, bool aligned16)
 {
     if (row >= row_lim || k_elem >= k_lim) return uint4(0u);
+    if (PACK_F32) {
+        Ptr<float, Access.Read> p = Ptr<float, Access.Read>(base_b) + uint64_t(row) * stride_elems + k_elem;
+        uint4 packed = 0u;
+        [ForceUnroll] for (uint i = 0u; i < 8u; ++i) {
+            if (i < k_lim - k_elem) packed[i / 2u] |= f32tof16(p[i]) << ((i % 2u) * 16u);
+        }
+        return packed;
+    }
     uint elems_per_u4 = uint(16 / ELEM_BYTES);
     uint64_t byte_off = (uint64_t(row) * uint64_t(stride_elems) + uint64_t(k_elem)) * uint64_t(ELEM_BYTES);
     if (aligned16 && (k_elem + elems_per_u4 <= k_lim)) {
@@ -162,13 +183,14 @@ void coopmat_mma_step<TMat : ICoopElement, TAcc : ICoopElement, let K_STEP : int
     coopmat_fma<TMat, TAcc, K_STEP, WARP_M, WARP_N>(acc, mA, mB);
 }
 
-void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
+void coopmat_gemm_smem<TStorage : ICoopElement, TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
                        let K_STEP : int, let ELEM_BYTES : int, let IS_QUANT : int,
                        let WG_M : int, let WG_N : int, let WARP_M : int, let WARP_N : int,
                        let NTHREADS : int,
                        S : ICoopSmemTile<WG_M, WG_N, WARP_M, WARP_N>>(
-    LinearArgs<TMat, TMat, float> a, TAcc zero_acc, uint3 gtid, uint3 gid)
+    LinearArgs<TStorage, TStorage, float> a, TAcc zero_acc, uint3 gtid, uint3 gid)
 {
+    static const bool pack_f32 = sizeof(TStorage) == 4;
     uint tid = gtid.x;
     uint warp_id = tid >> 5u;
     uint lane_id = tid & 31u;
@@ -195,8 +217,8 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
     uint bk_elems = elems_per_u4 * 4u;
     uint num_k_tiles = (a.k + bk_elems - 1u) / bk_elems;
     bool aligned16 = is_ptr_aligned16(a.x) && is_ptr_aligned16(a.w) &&
-                     (((a.x_stride * uint(ELEM_BYTES)) & 15u) == 0u) &&
-                     (((a.w_stride * uint(ELEM_BYTES)) & 15u) == 0u);
+                     (((a.x_stride * uint(sizeof(TStorage))) & 15u) == 0u) &&
+                     (((a.w_stride * uint(sizeof(TStorage))) & 15u) == 0u);
     bool fast_interior = aligned16 && ((a.k & (bk_elems - 1u)) == 0u) &&
                          (row0 + wg_m_u <= a.rows) && (col0 + wg_n_u <= a.m);
 
@@ -207,8 +229,8 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
     uint lu0 = tid & 3u;
 
     if (fast_interior && num_k_tiles > 0u) {
-        uint64_t x_off0 = (uint64_t(row0 + lr0) * uint64_t(a.x_stride) + uint64_t(lu0 * elems_per_u4)) * uint64_t(ELEM_BYTES);
-        uint64_t w_off0 = (uint64_t(col0 + lr0) * uint64_t(a.w_stride) + uint64_t(lu0 * elems_per_u4)) * uint64_t(ELEM_BYTES);
+        uint64_t x_off0 = (uint64_t(row0 + lr0) * uint64_t(a.x_stride) + uint64_t(lu0 * elems_per_u4)) * uint64_t(sizeof(TStorage));
+        uint64_t w_off0 = (uint64_t(col0 + lr0) * uint64_t(a.w_stride) + uint64_t(lu0 * elems_per_u4)) * uint64_t(sizeof(TStorage));
         Ptr<uint4, Access.Read> xp0 = Ptr<uint4, Access.Read>(xb + x_off0);
         Ptr<uint4, Access.Read> wp0 = Ptr<uint4, Access.Read>(wb + w_off0);
         uint64_t x_step_u4 = (uint64_t(kRowStep) * uint64_t(a.x_stride)) / uint64_t(elems_per_u4);
@@ -216,9 +238,9 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
         uint s0 = lr0 * kCmSmemStrideU4 + lu0;
 
         [ForceUnroll] for (uint v = 0u; v < kVecA; ++v)
-            S::storeA(s0 + v * (kRowStep * kCmSmemStrideU4), load_a16(xp0 + uint64_t(v) * x_step_u4));
+            S::storeA(s0 + v * (kRowStep * kCmSmemStrideU4), load_coop_tile<pack_f32>(xp0, uint64_t(v) * x_step_u4));
         [ForceUnroll] for (uint v = 0u; v < kVecB; ++v)
-            S::storeB(s0 + v * (kRowStep * kCmSmemStrideU4), load_a16(wp0 + uint64_t(v) * w_step_u4));
+            S::storeB(s0 + v * (kRowStep * kCmSmemStrideU4), load_coop_tile<pack_f32>(wp0, uint64_t(v) * w_step_u4));
         GroupMemoryBarrierWithGroupSync();
 
         for (uint kt = 0u; kt < num_k_tiles; ++kt) {
@@ -230,9 +252,9 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
             if (has_next) {
                 uint64_t k_u4 = uint64_t(kt + 1u) << 2u;
                 [ForceUnroll] for (uint v = 0u; v < kVecA; ++v)
-                    pA[v] = load_a16(xp0 + (uint64_t(v) * x_step_u4 + k_u4));
+                    pA[v] = load_coop_tile<pack_f32>(xp0, uint64_t(v) * x_step_u4 + k_u4);
                 [ForceUnroll] for (uint v = 0u; v < kVecB; ++v)
-                    pB[v] = load_a16(wp0 + (uint64_t(v) * w_step_u4 + k_u4));
+                    pB[v] = load_coop_tile<pack_f32>(wp0, uint64_t(v) * w_step_u4 + k_u4);
             }
             coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, 0u);
             linalg::CoopMat<TMat, MemoryScope.Subgroup, 16, K_STEP, linalg::CoopMatMatrixUse.MatrixA> mA1[WARP_M];
@@ -256,12 +278,12 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
             [ForceUnroll] for (uint v = 0u; v < kVecA; ++v) {
                 uint lr = lr0 + v * kRowStep;
                 S::storeA(lr * kCmSmemStrideU4 + lu0,
-                          load_u4_safe<ELEM_BYTES>(xb, row0 + lr, a.rows, k0 + lu0 * elems_per_u4, a.k, a.x_stride, aligned16));
+                          load_u4_safe<ELEM_BYTES, pack_f32>(xb, row0 + lr, a.rows, k0 + lu0 * elems_per_u4, a.k, a.x_stride, aligned16));
             }
             [ForceUnroll] for (uint v = 0u; v < kVecB; ++v) {
                 uint lr = lr0 + v * kRowStep;
                 S::storeB(lr * kCmSmemStrideU4 + lu0,
-                          load_u4_safe<ELEM_BYTES>(wb, col0 + lr, a.m, k0 + lu0 * elems_per_u4, a.k, a.w_stride, aligned16));
+                          load_u4_safe<ELEM_BYTES, pack_f32>(wb, col0 + lr, a.m, k0 + lu0 * elems_per_u4, a.k, a.w_stride, aligned16));
             }
             GroupMemoryBarrierWithGroupSync();
             coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, 0u);
@@ -302,30 +324,35 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
 
 [shader("compute")] [numthreads(256, 1, 1)]
 void vk_gemm_coopmat_f16(uniform LinearArgs<half, half, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    coopmat_gemm_smem<half, float, EpBias, 16, 2, 0, 128, 128, 4, 2, 256, CoopSmem128>(a, 0.0f, gtid, gid);
+    coopmat_gemm_smem<half, half, float, EpBias, 16, 2, 0, 128, 128, 4, 2, 256, CoopSmem128>(a, 0.0f, gtid, gid);
 }
 
 [shader("compute")] [numthreads(256, 1, 1)]
 void vk_gemm_coopmat_bf16(uniform LinearArgs<BFloat16, BFloat16, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    coopmat_gemm_smem<BFloat16, float, EpBias, 16, 2, 0, 128, 128, 4, 2, 256, CoopSmem128>(a, 0.0f, gtid, gid);
+    coopmat_gemm_smem<BFloat16, BFloat16, float, EpBias, 16, 2, 0, 128, 128, 4, 2, 256, CoopSmem128>(a, 0.0f, gtid, gid);
 }
 
 [shader("compute")] [numthreads(256, 1, 1)]
 void vk_gemm_coopmat_w8a8(uniform LinearArgs<int8_t, int8_t, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    coopmat_gemm_smem<int8_t, int32_t, EpQuantScale, 32, 1, 1, 128, 128, 4, 2, 256, CoopSmem128>(a, 0, gtid, gid);
+    coopmat_gemm_smem<int8_t, int8_t, int32_t, EpQuantScale, 32, 1, 1, 128, 128, 4, 2, 256, CoopSmem128>(a, 0, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
 void vk_gemm_coopmat_f16_64(uniform LinearArgs<half, half, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    coopmat_gemm_smem<half, float, EpBias, 16, 2, 0, 64, 64, 2, 2, 128, CoopSmem64>(a, 0.0f, gtid, gid);
+    coopmat_gemm_smem<half, half, float, EpBias, 16, 2, 0, 64, 64, 2, 2, 128, CoopSmem64>(a, 0.0f, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
 void vk_gemm_coopmat_bf16_64(uniform LinearArgs<BFloat16, BFloat16, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    coopmat_gemm_smem<BFloat16, float, EpBias, 16, 2, 0, 64, 64, 2, 2, 128, CoopSmem64>(a, 0.0f, gtid, gid);
+    coopmat_gemm_smem<BFloat16, BFloat16, float, EpBias, 16, 2, 0, 64, 64, 2, 2, 128, CoopSmem64>(a, 0.0f, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
 void vk_gemm_coopmat_w8a8_64(uniform LinearArgs<int8_t, int8_t, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    coopmat_gemm_smem<int8_t, int32_t, EpQuantScale, 32, 1, 1, 64, 64, 2, 2, 128, CoopSmem64>(a, 0, gtid, gid);
+    coopmat_gemm_smem<int8_t, int8_t, int32_t, EpQuantScale, 32, 1, 1, 64, 64, 2, 2, 128, CoopSmem64>(a, 0, gtid, gid);
+}
+
+[shader("compute")] [numthreads(128, 1, 1)]
+void vk_gemm_f32_as_f16(uniform LinearArgs<float, float, float> a, uint3 tid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    coopmat_gemm_smem<float, half, float, EpBias, 16, 2, 0, 64, 64, 2, 2, 128, CoopSmem64>(a, 0.0f, tid, gid);
 }

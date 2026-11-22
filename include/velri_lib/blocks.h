@@ -104,6 +104,8 @@ typedef struct {
     uint32_t layer_depth;
     uint32_t skipped_layer_pushes;
     velri_placement_resolve_checked_fn resolve_checked_fn;
+    bool allow_f16_matmul; /* Allow F32 linear ops to use F16 operands with F32 accumulation. */
+    bool allow_f16_attention_matmul; /* Permit F16 operands in dense prefill attention. */
 } velri_builder;
 
 void velri_b_init(velri_builder *b, velri_graph *graph, velri_manifest *manifest,
@@ -249,6 +251,7 @@ typedef struct {
     bool latent_kv;             /* True => cache single input `h_cache` + exact weight absorption */
     velri_rope_spec rope;       /* Optional Rotary Position Embeddings applied to Q and K */
     velri_dtype dtype;
+    bool f16_kv;                /* Store dense K/V state in IEEE binary16. Zero uses activation dtype. */
 } velri_attention_spec;
 
 typedef struct {
@@ -273,6 +276,7 @@ typedef struct {
     velri_norm_spec norm;
     velri_attention_spec attn;
     velri_mlp_spec mlp;
+    bool last_row_only;      /* Return the last active row. Attention still updates the entire KV cache. */
 } velri_layer_spec;
 
 typedef struct {

@@ -306,7 +306,10 @@ static velri_status cpu_query_operation(const velri_backend_device *dev,
     if (!dev || !op) {
         return VELRI_ERR_INVALID;
     }
-    return velri_op_validate(op);
+    velri_status st = velri_op_validate(op);
+    if (st == VELRI_OK && op->kind == VELRI_OP_ATTENTION && op->outputs[1].dtype != VELRI_DTYPE_F32)
+        return VELRI_ERR_UNSUPPORTED;
+    return st;
 }
 
 /* ---- 5. Execution ---- */
@@ -791,6 +794,7 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         break;
 
     case VELRI_OP_ATTENTION: {
+        if (op->outputs[1].dtype != VELRI_DTYPE_F32) return VELRI_ERR_UNSUPPORTED;
         velri_attn_step_args aa;
         st = velri_op_resolve_attention_step(op, item->params, &aa);
         if (st != VELRI_OK) {

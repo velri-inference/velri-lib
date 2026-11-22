@@ -815,6 +815,7 @@ velri_tensor velri_b_linear_into(velri_builder *b, velri_tensor x, velri_tensor 
         op.inputs[2] = bias_or_none.view_id;
     }
     op.outputs[0] = out.view_id;
+    op.attr.linear.allow_f16_matmul = b->allow_f16_matmul;
     op.attr.linear.desc = (velri_linear_desc){
         .x_dtype = x.dtype,
         .w_dtype = w.dtype,
@@ -1176,6 +1177,7 @@ static velri_tensor emit_attention(velri_builder *b, velri_tensor q, velri_tenso
     op.attr.attention.scale = scale;
     op.attr.attention.sliding_window = sliding_window;
     op.attr.attention.causal = causal;
+    op.attr.attention.allow_f16_matmul = b->allow_f16_attention_matmul;
 
     return emit_op_on(b, &op, compute_dev) ? out : VELRI_TENSOR_NONE;
 }

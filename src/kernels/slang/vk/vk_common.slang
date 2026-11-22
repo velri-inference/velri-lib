@@ -10,6 +10,15 @@ public static const uint kRowWgSize = 256u;
 public static const uint kRowRegCacheMaxDim = 4096u;
 public static const uint kGemvWgSize = 128u;
 
+// Select a valid physical address before the load. Software subgroup implementations
+// may issue uniform loads for inactive lanes, including eager kernels without step data.
+public uint step_word_or(Ptr<uint, Access.Read> step, uint index, uint fallback,
+                         Ptr<float, Access.Read> read_only) {
+    Ptr<uint, Access.Read> word = step != nullptr ? step + index : Ptr<uint, Access.Read>(read_only);
+    uint value = word[0];
+    return step != nullptr ? value : fallback;
+}
+
 public bool is_ptr_aligned16<T, let A : Access>(Ptr<T, A> p) {
     uint64_t addr = spirv_asm { result : $$uint64_t = OpConvertPtrToU $p; };
     return (uint(addr) & 15u) == 0u;

@@ -245,14 +245,6 @@ velri_status velri_vk_enumerate_devices(uint32_t *out_count) {
 
 /* ---- 2. Device Helpers ---- */
 
-typedef struct {
-    VkBool32 shader_int16;
-    VkBool32 storage_16bit;
-    VkBool32 storage_8bit;
-    VkBool32 shader_float16;
-    VkBool32 shader_int8;
-} vk_probed_feats;
-
 static void populate_device_caps(velri_backend_device *dev,
                                  const VkPhysicalDeviceProperties2 *props2,
                                  const VkPhysicalDeviceSubgroupProperties *sg_props) {
@@ -302,8 +294,9 @@ static void populate_device_caps(velri_backend_device *dev,
     dev->caps.min_align_bytes = min_align;
 }
 
-static velri_status probe_features_and_coopmat(velri_backend_device *dev, uint32_t max_smem,
+static velri_status probe_features_and_coopmat(velri_backend_device *dev, const VkPhysicalDeviceLimits *limits,
                                                vk_probed_feats *out_feats) {
+    uint32_t max_smem = limits->maxComputeSharedMemorySize;
     uint32_t nexts = 0U;
     dev->inst.vkEnumerateDeviceExtensionProperties(dev->phys, nullptr, &nexts, nullptr);
     VkExtensionProperties *exts =
@@ -315,6 +308,12 @@ static velri_status probe_features_and_coopmat(velri_backend_device *dev, uint32
         dev->inst.vkEnumerateDeviceExtensionProperties(dev->phys, nullptr, &nexts, exts);
     }
     bool ext_coopmat = has_ext(exts, nexts, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+#ifdef VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME
+    bool ext_cm2 = has_ext(exts, nexts, VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
+    VkPhysicalDeviceCooperativeMatrix2FeaturesNV f_cm2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV,
+    };
+#endif
 #ifdef VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME
     bool ext_bf16 = has_ext(exts, nexts, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
     VkPhysicalDeviceShaderBfloat16FeaturesKHR f_bf16 = {
@@ -340,6 +339,12 @@ static velri_status probe_features_and_coopmat(velri_backend_device *dev, uint32
         .pNext = &f12,
     };
     void **tail_pnext = &f13.pNext;
+#ifdef VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME
+    if (ext_cm2) {
+        *tail_pnext = &f_cm2;
+        tail_pnext = &f_cm2.pNext;
+    }
+#endif
     if (ext_coopmat) {
         *tail_pnext = &f_cm;
         tail_pnext = &f_cm.pNext;
@@ -367,6 +372,9 @@ static velri_status probe_features_and_coopmat(velri_backend_device *dev, uint32
     if (f2.features.shaderInt16 && f11.storageBuffer16BitAccess) {
         dev->caps_mask |= VK_CAP_INT16;
     }
+    if ((dev->caps_mask & VK_CAP_INT16) && f12.shaderFloat16) {
+        dev->caps_mask |= VK_CAP_F16_KV;
+    }
     if ((dev->caps_mask & VK_CAP_INT16) && f12.shaderFloat16 && f12.shaderInt8 &&
         f12.storageBuffer8BitAccess) {
         dev->caps_mask |= VK_CAP_F16_I8;
@@ -374,6 +382,7 @@ static velri_status probe_features_and_coopmat(velri_backend_device *dev, uint32
     if (f13.shaderIntegerDotProduct) {
         dev->caps_mask |= VK_CAP_INT_DOT;
     }
+    if (max_smem >= 32768U) dev->caps_mask |= VK_CAP_SHARED_32K;
     if (max_smem >= VK_GEMM_F32_SMEM_BYTES) {
         dev->caps_mask |= VK_CAP_F32_GEMM;
     }
@@ -427,6 +436,13 @@ static velri_status probe_features_and_coopmat(velri_backend_device *dev, uint32
         }
         free(cm_props);
     }
+#ifdef VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME
+    if ((dev->caps_mask & VK_CAP_CM_F16) && f_cm2.cooperativeMatrixReductions &&
+        f_cm2.cooperativeMatrixConversions && f_cm2.cooperativeMatrixPerElementOperations &&
+        max_smem >= 49152U && limits->maxComputeWorkGroupSize[0] >= 256U) {
+        dev->caps_mask |= VK_CAP_NV_ATTENTION;
+    }
+#endif
     return VELRI_OK;
 }
 
@@ -451,6 +467,19 @@ static velri_status create_logical_device(velri_backend_device *dev,
     void *bf16_next = enable_bf16 ? (void *)&en_bf16 : nullptr;
 #else
     void *bf16_next = nullptr;
+#endif
+#ifdef VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME
+    VkPhysicalDeviceCooperativeMatrix2FeaturesNV en_cm2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV,
+        .pNext = bf16_next,
+        .cooperativeMatrixReductions = VK_TRUE,
+        .cooperativeMatrixConversions = VK_TRUE,
+        .cooperativeMatrixPerElementOperations = VK_TRUE,
+    };
+    if (dev->caps_mask & VK_CAP_NV_ATTENTION) {
+        en_exts[n_en_exts++] = VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME;
+        bf16_next = &en_cm2;
+    }
 #endif
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR en_cm = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
@@ -559,10 +588,7 @@ velri_status velri_vk_init_cmd_slot(velri_backend_device *dev, VkCommandPool *ou
 
 /* ---- 2. Device Lifecycle ---- */
 
-void velri_vk_close_device(velri_backend_device *dev) {
-    if (!dev) {
-        return;
-    }
+static void release_logical_device(velri_backend_device *dev) {
     if (dev->device) {
         if (dev->queue && dev->vkQueueWaitIdle) {
             dev->vkQueueWaitIdle(dev->queue);
@@ -606,15 +632,86 @@ void velri_vk_close_device(velri_backend_device *dev) {
         }
     }
     free(dev->enc_scratch);
+}
+
+void velri_vk_close_device(velri_backend_device *dev) {
+    if (!dev) {
+        return;
+    }
+    release_logical_device(dev);
     velri_os_cond_destroy(dev->slot_cv);
     velri_os_mutex_destroy(dev->mtx);
     vk_inst_destroy(&dev->inst);
     free(dev);
 }
 
+static velri_status init_logical_resources(velri_backend_device *dev) {
+    velri_status st = create_logical_device(dev, &dev->features);
+    if (st != VELRI_OK) {
+        return st;
+    }
+
+    st = velri_vk_init_cmd_slot(dev, &dev->xfer_pool, &dev->xfer_cmd, &dev->xfer_fence);
+    if (st != VELRI_OK) {
+        return st;
+    }
+    for (uint32_t i = 0U; i < VK_CMD_RING_SIZE; ++i) {
+        st = velri_vk_init_cmd_slot(dev, &dev->ring[i].pool, &dev->ring[i].cmd,
+                                    &dev->ring[i].fence);
+        if (st != VELRI_OK) {
+            return st;
+        }
+    }
+
+    dev->enc_scratch =
+        (vk_encoded_dispatch *)calloc(VK_ENC_SCRATCH_INIT_CAP, sizeof(*dev->enc_scratch));
+    if (!dev->enc_scratch) {
+        return VELRI_ERR_NOMEM;
+    }
+    dev->enc_scratch_cap = VK_ENC_SCRATCH_INIT_CAP;
+
+    VkPushConstantRange pcr = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0U,
+        .size = VK_MAX_PC_BYTES,
+    };
+    VkPipelineLayoutCreateInfo pl_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1U,
+        .pPushConstantRanges = &pcr,
+    };
+    if (dev->vkCreatePipelineLayout(dev->device, &pl_ci, nullptr, &dev->pipe_layout) !=
+        VK_SUCCESS) {
+        return VELRI_ERR_NOMEM;
+    }
+
+    return velri_vk_init_staging_buffer(dev);
+}
+
+/* Called before publishing the device or under its mutex. A failed activation releases
+ * everything it acquired, so a later prepare or allocation may retry. */
+velri_status velri_vk_activate_locked(velri_backend_device *dev) {
+    if (dev->device) {
+        return VELRI_OK;
+    }
+    velri_status st = init_logical_resources(dev);
+    if (st != VELRI_OK) {
+        release_logical_device(dev);
+        dev->device = VK_NULL_HANDLE;
+        dev->queue = VK_NULL_HANDLE;
+        dev->pipe_layout = VK_NULL_HANDLE;
+        dev->xfer_pool = VK_NULL_HANDLE;
+        dev->xfer_cmd = VK_NULL_HANDLE;
+        dev->xfer_fence = VK_NULL_HANDLE;
+        memset(dev->ring, 0, sizeof(dev->ring));
+        dev->enc_scratch = nullptr;
+        dev->enc_scratch_cap = 0U;
+    }
+    return st;
+}
+
 velri_status velri_vk_open_device(uint32_t local_index, const void *cfg,
                                   velri_backend_device **out_dev) {
-    (void)cfg;
     if (!out_dev) {
         return VELRI_ERR_INVALID;
     }
@@ -654,15 +751,7 @@ velri_status velri_vk_open_device(uint32_t local_index, const void *cfg,
     dev->inst.vkGetPhysicalDeviceMemoryProperties(dev->phys, &dev->mem_props);
     populate_device_caps(dev, &props2, &sg_props);
 
-    vk_probed_feats feats = {0};
-    st = probe_features_and_coopmat(dev, props2.properties.limits.maxComputeSharedMemorySize,
-                                    &feats);
-    if (st != VELRI_OK) {
-        velri_vk_close_device(dev);
-        return st;
-    }
-
-    st = create_logical_device(dev, &feats);
+    st = probe_features_and_coopmat(dev, &props2.properties.limits, &dev->features);
     if (st != VELRI_OK) {
         velri_vk_close_device(dev);
         return st;
@@ -673,50 +762,16 @@ velri_status velri_vk_open_device(uint32_t local_index, const void *cfg,
         return VELRI_ERR_NOMEM;
     }
 
-    st = velri_vk_init_cmd_slot(dev, &dev->xfer_pool, &dev->xfer_cmd, &dev->xfer_fence);
-    if (st != VELRI_OK) {
-        velri_vk_close_device(dev);
-        return st;
-    }
-    for (uint32_t i = 0U; i < VK_CMD_RING_SIZE; ++i) {
-        st = velri_vk_init_cmd_slot(dev, &dev->ring[i].pool, &dev->ring[i].cmd,
-                                    &dev->ring[i].fence);
+    /* Keep the primary Vulkan device eager. Additional enumerated devices acquire their
+     * queues, pipelines and transfer resources when a plan actually selects them. */
+    const velri_vk_open_cfg *vk_cfg = cfg;
+    if (local_index == 0U || !vk_cfg || !vk_cfg->defer_secondary_devices) {
+        st = velri_vk_activate_locked(dev);
         if (st != VELRI_OK) {
             velri_vk_close_device(dev);
             return st;
         }
     }
-
-    dev->enc_scratch =
-        (vk_encoded_dispatch *)calloc(VK_ENC_SCRATCH_INIT_CAP, sizeof(*dev->enc_scratch));
-    if (!dev->enc_scratch) {
-        velri_vk_close_device(dev);
-        return VELRI_ERR_NOMEM;
-    }
-    dev->enc_scratch_cap = VK_ENC_SCRATCH_INIT_CAP;
-
-    VkPushConstantRange pcr = {
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        .offset = 0U,
-        .size = VK_MAX_PC_BYTES,
-    };
-    VkPipelineLayoutCreateInfo pl_ci = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .pushConstantRangeCount = 1U,
-        .pPushConstantRanges = &pcr,
-    };
-    if (dev->vkCreatePipelineLayout(dev->device, &pl_ci, nullptr, &dev->pipe_layout) !=
-        VK_SUCCESS) {
-        velri_vk_close_device(dev);
-        return VELRI_ERR_NOMEM;
-    }
-
-    st = velri_vk_init_staging_buffer(dev);
-    if (st != VELRI_OK) {
-        velri_vk_close_device(dev);
-        return st;
-    }
-
     *out_dev = dev;
     return VELRI_OK;
 }

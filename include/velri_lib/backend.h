@@ -104,6 +104,7 @@ typedef struct {
     union {
         struct {
             velri_linear_desc desc;
+            bool allow_f16_matmul; /* Optional reduced operand precision for multirow F32 GEMM. */
         } linear;
         struct {
             float eps;
@@ -143,6 +144,7 @@ typedef struct {
             float scale;             /* 0.0f => 1.0f / sqrtf((float)head_dim) */
             uint32_t sliding_window; /* 0 => full causal history */
             bool causal;
+            bool allow_f16_matmul; /* Dense prefill may round Q and softmax weights to F16. */
         } attention;
         struct {
             uint32_t n_heads;       /* Batch count per token row (B >= 1) */

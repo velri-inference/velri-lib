@@ -471,7 +471,8 @@ velri_status velri_op_validate(const velri_resolved_op *op) {
         }
         if (!is_nonoverlapping_unit_inner_3d(k_cache) ||
             !is_nonoverlapping_unit_inner_3d(v_cache) ||
-            k_cache->dtype != VELRI_DTYPE_F32 || v_cache->dtype != VELRI_DTYPE_F32) {
+            (k_cache->dtype != VELRI_DTYPE_F32 && k_cache->dtype != VELRI_DTYPE_F16) ||
+            v_cache->dtype != k_cache->dtype) {
             return VELRI_ERR_INVALID;
         }
         size_t max_ctx = k_cache->dims[1];

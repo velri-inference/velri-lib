@@ -53,7 +53,7 @@ typedef struct {
     size_t state_bytes;            /* Per-slot persistent state (KV, GDN, conv) */
     size_t scratch_unpacked_bytes; /* Sum of declared scratch storages on this device */
     size_t scratch_packed_bytes;   /* Actual liveness-packed scratch arena per slot */
-    size_t allocator_overhead_bytes;
+    size_t allocator_overhead_bytes; /* Arena padding and optional backend output staging. */
     size_t state_overhead_bytes;   /* STATE arena alignment subset of `allocator_overhead_bytes` */
 } velri_device_memory_report;
 

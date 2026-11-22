@@ -40,6 +40,9 @@ set(VELRI_SLANG_VK_DEPS
     ${VELRI_SLANG_COMMON_DEPS}
     "${VELRI_SLANG_DIR}/common/reductions.slang"
     "${VELRI_SLANG_DIR}/common/reductions_wide.slang"
+    "${VELRI_SLANG_DIR}/vk/attention_args.slang"
+    "${VELRI_SLANG_DIR}/vk/flash_attention_coop_common.slang"
+    "${VELRI_SLANG_DIR}/vk/flash_attention_half.slang"
 )
 
 set(_velri_obj_ext "${CMAKE_C_OUTPUT_EXTENSION}")
@@ -290,7 +293,12 @@ function(velri_compile_vk_shaders out_header spv_dir header_path spec_list abi_h
             set(_reflect_args -reflection-json "${_reflect_output}")
             list(APPEND _reflections "${_reflect_output}")
         endif()
+        set(_slang_entry "${_entry}")
         set(_extra_caps)
+        if(_entry MATCHES "_f16kv$")
+            string(REGEX REPLACE "_f16kv$" "_f32" _slang_entry "${_entry}")
+            list(APPEND _extra_caps -DVELRI_F16_KV=1)
+        endif()
         if(_entry STREQUAL "vk_gemm_coopmat_bf16" OR _entry STREQUAL "vk_gemm_coopmat_bf16_64" OR
            _entry STREQUAL "vk_ceiling_coopmat_bf16")
             list(APPEND _extra_caps -capability spvBFloat16KHR)
@@ -308,7 +316,7 @@ function(velri_compile_vk_shaders out_header spv_dir header_path spec_list abi_h
                 -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/vk"
                 -target spirv -profile spirv_1_6 -Wno-41012 -fvk-use-c-layout -O3
                 ${_extra_caps} ${_reflect_args}
-                -entry "${_entry}" -stage compute -o "${_spv}"
+                -entry "${_slang_entry}" -stage compute -o "${_spv}"
             ${_val_cmd}
             DEPENDS "${_src_path}" "${VELRI_SLANG_DIR}/vk/vk_common.slang" ${VELRI_SLANG_VK_DEPS}
             COMMENT "${_spv_comment}"
@@ -378,25 +386,51 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/elementwise.slang|vk_fwht_f32"
         "${_vk}/elementwise.slang|vk_quantize_row_f32_i8"
         "${_vk}/gemv.slang|vk_gemv_f32"
+        "${_vk}/decode_fusion.slang|vk_qkv_rope_cache_f32"
+        "${_vk}/decode_fusion.slang|vk_qkv_rope_cache_f16kv"
+        "${_vk}/decode_fusion.slang|vk_rms_qkv_f32"
+        "${_vk}/decode_fusion.slang|vk_rms_qkv_f16kv"
+        "${_vk}/decode_fusion.slang|vk_rms_gated_gemv_f32"
+        "${_vk}/decode_fusion.slang|vk_gated_gemv_f32"
+        "${_vk}/decode_fusion.slang|vk_gemv_residual_f32"
         "${_vk}/gemv.slang|vk_gemv_f16"
         "${_vk}/gemv.slang|vk_gemv_bf16"
         "${_vk}/gemv.slang|vk_gemv_w8a8"
         "${_vk}/gemm_f32.slang|vk_gemm_f32"
+        "${_vk}/gemm_short.slang|vk_gemm_short_f32"
+        "${_vk}/gemv.slang|vk_gemv_rows_f32"
         "${_vk}/gemm_f32.slang|vk_splitk_reduce"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_f16"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_bf16"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_w8a8"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_f16_64"
+        "${_vk}/gemm_coopmat.slang|vk_gemm_f32_as_f16"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_bf16_64"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_w8a8_64"
         "${_vk}/gather_copy.slang|vk_embedding_f32"
         "${_vk}/gather_copy.slang|vk_copy_last_row_f32"
         "${_vk}/attention.slang|vk_kv_append_f32"
+        "${_vk}/attention.slang|vk_kv_append_f16kv"
         "${_vk}/attention.slang|vk_attention_decode_f32"
+        "${_vk}/attention.slang|vk_attention_decode_f16kv"
         "${_vk}/attention.slang|vk_attention_prefill_f32"
+        "${_vk}/attention.slang|vk_attention_prefill_f16kv"
+        "${_vk}/flash_attention.slang|vk_flash_attention_f32"
+        "${_vk}/flash_attention.slang|vk_flash_attention_f16kv"
+        "${_vk}/flash_attention_coop.slang|vk_prefill_coop_f16kv"
+        "${_vk}/flash_attention_coop_half.slang|vk_prefill_coop_half_f16kv"
+        "${_vk}/flash_attention_coop_nv.slang|vk_prefill_coop_nv_f16kv"
+        "${_vk}/flash_attention_split.slang|vk_prefill_tile_f32"
+        "${_vk}/flash_attention_split.slang|vk_prefill_split_f32"
+        "${_vk}/flash_attention_split.slang|vk_prefill_split_f16kv"
+        "${_vk}/flash_attention_split.slang|vk_prefill_merge_f32"
         "${_vk}/attention.slang|vk_attention_wide_f32"
+        "${_vk}/attention.slang|vk_attention_wide_f16kv"
         "${_vk}/attention.slang|vk_attention_splitkv_f32"
+        "${_vk}/attention.slang|vk_attention_splitkv_f16kv"
         "${_vk}/attention.slang|vk_attention_splitkv_reduce_f32"
+        "${_vk}/attention_decode_grouped.slang|vk_attention_grouped_f16kv"
+        "${_vk}/attention.slang|vk_attention_merge64_f32"
         "${_vk}/batched_linear.slang|vk_batched_linear_nt_f32"
         "${_vk}/batched_linear.slang|vk_batched_linear_nn_f32"
     )

@@ -22,7 +22,7 @@ struct RopeArgs<T : IElement> {
 
 void rope_gpu_impl<T : IElement, VIO : IVecIO128<T>>(RopeArgs<T> a, uint3 gid, uint3 gtid) {
     uint half_rot = a.rotary_dim >> 1u;
-    uint eff_pos = (a.step_params != nullptr) ? a.step_params[1] : a.pos_offset;
+    uint eff_pos = step_word_or(a.step_params, 1u, a.pos_offset, a.cos_tbl);
     if ((a.mode & 2u) != 0u) {
         uint v_elems = VIO.kElems;
         uint n_vec = half_rot / v_elems;

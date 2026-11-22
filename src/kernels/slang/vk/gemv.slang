@@ -101,3 +101,32 @@ void vk_gemv_w8a8(uniform LinearArgs<int8_t, int8_t, float> a, uint3 gtid : SV_G
             EpQuantScale::apply(float(total), row, col, make_epilogue_params(a.bias, a.x_scale, a.w_scale, a.flags));
     }
 }
+
+// Reuse each aligned weight vector across four prompt rows. A subgroup owns
+// one output channel and masks unused rows of the final group.
+[shader("compute")] [numthreads(128, 1, 1)]
+void vk_gemv_rows_f32(uniform LinearArgs<float, float, float> a, uint3 group : SV_GroupID) {
+    uint lanes = WaveGetLaneCount(), lane = WaveGetLaneIndex();
+    uint col = group.x * (kGemvWgSize / lanes) + WaveGetWaveIndex();
+    uint first = group.y * 4u;
+    if (col >= a.m) return;
+    Ptr<float4, Access.Read> weights = Ptr<float4, Access.Read>(a.w + uint64_t(col) * a.w_stride);
+    float4 sums = float4(0.0f);
+    for (uint k = lane; k < a.k / 4u; k += lanes) {
+        float4 weight = load_a16(weights + k);
+        [ForceUnroll] for (uint r = 0u; r < 4u; ++r) {
+            if (first + r < a.rows) {
+                Ptr<float4, Access.Read> x = Ptr<float4, Access.Read>(
+                    a.x + uint64_t(first + r) * a.x_stride);
+                sums[r] += dot(load_a16(x + k), weight);
+            }
+        }
+    }
+    sums = WaveActiveSum(sums);
+    if (lane == 0u) {
+        float bias = ((a.flags & kEpFlagBias) != 0u) ? a.bias[col] : 0.0f;
+        [ForceUnroll] for (uint r = 0u; r < 4u; ++r) {
+            if (first + r < a.rows) a.y[uint64_t(first + r) * a.y_stride + col] = sums[r] + bias;
+        }
+    }
+}

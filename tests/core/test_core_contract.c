@@ -180,23 +180,24 @@ static void ref_swiglu_mlp_block(size_t rows, size_t d, size_t ff, float eps, co
     free(xn); free(g); free(u); free(h); free(down);
 }
 
-static void test_standalone_mlp_two_concurrent_slots(velri_context *ctx, velri_device_id cpu_dev) {
-    const size_t rows = 8U, d = 64U, ff = 128U;
+static void test_standalone_mlp_two_concurrent_slots(velri_context *ctx, velri_device_id dev,
+                                                     bool expect_replay) {
+    const size_t rows = expect_replay ? 1U : 8U, d = 64U, ff = 128U;
     const float eps = 1e-5f;
 
     velri_graph *g = nullptr;
     CHECK_OK(velri_graph_create(&g), "mlp graph");
-    velri_storage_id s_x = add_f32_storage(g, VELRI_STORAGE_INPUT, rows * d, cpu_dev);
-    velri_storage_id s_nw = add_f32_storage(g, VELRI_STORAGE_WEIGHT, d, cpu_dev);
-    velri_storage_id s_wg = add_f32_storage(g, VELRI_STORAGE_WEIGHT, ff * d, cpu_dev);
-    velri_storage_id s_wu = add_f32_storage(g, VELRI_STORAGE_WEIGHT, ff * d, cpu_dev);
-    velri_storage_id s_wd = add_f32_storage(g, VELRI_STORAGE_WEIGHT, d * ff, cpu_dev);
-    velri_storage_id s_xn = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * d, cpu_dev);
-    velri_storage_id s_g = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * ff, cpu_dev);
-    velri_storage_id s_u = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * ff, cpu_dev);
-    velri_storage_id s_h = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * ff, cpu_dev);
-    velri_storage_id s_dn = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * d, cpu_dev);
-    velri_storage_id s_y = add_f32_storage(g, VELRI_STORAGE_OUTPUT, rows * d, cpu_dev);
+    velri_storage_id s_x = add_f32_storage(g, VELRI_STORAGE_INPUT, rows * d, dev);
+    velri_storage_id s_nw = add_f32_storage(g, VELRI_STORAGE_WEIGHT, d, dev);
+    velri_storage_id s_wg = add_f32_storage(g, VELRI_STORAGE_WEIGHT, ff * d, dev);
+    velri_storage_id s_wu = add_f32_storage(g, VELRI_STORAGE_WEIGHT, ff * d, dev);
+    velri_storage_id s_wd = add_f32_storage(g, VELRI_STORAGE_WEIGHT, d * ff, dev);
+    velri_storage_id s_xn = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * d, dev);
+    velri_storage_id s_g = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * ff, dev);
+    velri_storage_id s_u = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * ff, dev);
+    velri_storage_id s_h = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * ff, dev);
+    velri_storage_id s_dn = add_f32_storage(g, VELRI_STORAGE_SCRATCH, rows * d, dev);
+    velri_storage_id s_y = add_f32_storage(g, VELRI_STORAGE_OUTPUT, rows * d, dev);
 
     velri_view_id vx = add_2d_view(g, s_x, rows, d);
     velri_view_id vnw = add_1d_view(g, s_nw, d);
@@ -224,13 +225,13 @@ static void test_standalone_mlp_two_concurrent_slots(velri_context *ctx, velri_d
         {.kind = VELRI_OP_VEC_AXPBY, .num_inputs = 2U, .num_outputs = 1U,
          .inputs = {vx, vdn}, .outputs = {vy}, .attr.axpby = {.alpha = 1.0f, .beta = 1.0f}},
     };
-    for (int i = 0; i < 6; ++i) CHECK_OK(velri_graph_add_op(g, &ops[i], cpu_dev, nullptr), "add");
+    for (int i = 0; i < 6; ++i) CHECK_OK(velri_graph_add_op(g, &ops[i], dev, nullptr), "add");
 
     velri_plan *plan = nullptr;
     CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prepare mlp");
     velri_memory_report rep;
     CHECK_OK(velri_plan_memory_report(plan, &rep), "report");
-    CHECK(rep.devices[cpu_dev].scratch_packed_bytes < rep.devices[cpu_dev].scratch_unpacked_bytes,
+    CHECK(rep.devices[dev].scratch_packed_bytes < rep.devices[dev].scratch_unpacked_bytes,
           "scratch packer reuses memory");
     CHECK(rep.num_ram_transfers == 0U, "single-device 0 RAM transfers");
 
@@ -265,11 +266,15 @@ static void test_standalone_mlp_two_concurrent_slots(velri_context *ctx, velri_d
     CHECK_OK(velri_slot_create(plan, &slot0), "slot0");
     CHECK_OK(velri_slot_create(plan, &slot1), "slot1");
     CHECK_OK(velri_slot_bind_host(slot0, s_x, x0, rows * d * sizeof(float)), "x0");
-    CHECK_OK(velri_slot_bind_host(slot0, s_y, y0, rows * d * sizeof(float)), "y0");
     CHECK_OK(velri_slot_bind_host(slot1, s_x, x1, rows * d * sizeof(float)), "x1");
-    CHECK_OK(velri_slot_bind_host(slot1, s_y, y1, rows * d * sizeof(float)), "y1");
 
     for (int iter = 0; iter < 4; ++iter) {
+        float *dst0 = (iter & 1) ? y1 : y0;
+        float *dst1 = (iter & 1) ? y0 : y1;
+        memset(dst0, 0, rows * d * sizeof(float));
+        memset(dst1, 0, rows * d * sizeof(float));
+        CHECK_OK(velri_slot_bind_host(slot0, s_y, dst0, rows * d * sizeof(float)), "rebind y0");
+        CHECK_OK(velri_slot_bind_host(slot1, s_y, dst1, rows * d * sizeof(float)), "rebind y1");
         slot_thread_args a0 = {.slot = slot0, .st = VELRI_ERR_EXEC};
         slot_thread_args a1 = {.slot = slot1, .st = VELRI_ERR_EXEC};
         velri_os_thread *t0 = nullptr, *t1 = nullptr;
@@ -281,10 +286,15 @@ static void test_standalone_mlp_two_concurrent_slots(velri_context *ctx, velri_d
         CHECK_OK(a1.st, "slot1 run");
         CHECK(velri_slot_last_run_allocs(slot0) == 0U && velri_slot_last_run_allocs(slot1) == 0U,
               "0 B hot-path allocs");
+        CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ref0, dst0, rows, d, d) < 1e-4,
+              "first slot writes its current host binding");
+        CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ref1, dst1, rows, d, d) < 1e-4,
+              "second slot writes its current host binding");
+        if (expect_replay) {
+            CHECK(velri_slot_last_run_graph_replays(slot0) == 1U &&
+                  velri_slot_last_run_graph_replays(slot1) == 1U, "both slots replayed");
+        }
     }
-
-    CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ref0, y0, rows, d, d) < 1e-4, "slot0 match");
-    CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ref1, y1, rows, d, d) < 1e-4, "slot1 match");
 
     velri_slot_destroy(slot0);
     velri_slot_destroy(slot1);
@@ -1090,7 +1100,7 @@ int main(void) {
     CHECK_OK(velri_context_find_device(ctx, "mock_async", 0U, &mock_dev), "find mock_async:0");
 
     test_validation_and_guards(ctx, cpu_dev);
-    test_standalone_mlp_two_concurrent_slots(ctx, cpu_dev);
+    test_standalone_mlp_two_concurrent_slots(ctx, cpu_dev, false);
     test_no_silent_cpu_fallback(ctx, mock_dev);
     test_cross_device_coherence_and_dedup(ctx, cpu_dev, mock_dev);
     test_shared_weights_and_resident_state(ctx, mock_dev);
@@ -1098,6 +1108,10 @@ int main(void) {
     test_errors_and_cancellation(ctx, cpu_dev, mock_dev);
     test_shared_weights_and_shared_state_dual_plan(ctx, cpu_dev, mock_dev);
 #ifdef VELRI_CORE_HAS_VULKAN
+    velri_device_id vk_dev;
+    if (velri_context_find_device(ctx, "vulkan", 0U, &vk_dev) == VELRI_OK) {
+        test_standalone_mlp_two_concurrent_slots(ctx, vk_dev, true);
+    }
     test_hybrid_cpu_vulkan(ctx, cpu_dev);
 #endif
 

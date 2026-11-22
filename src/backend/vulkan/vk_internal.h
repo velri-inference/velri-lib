@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <vulkan/vulkan.h>
 
 /*
@@ -18,17 +19,23 @@
 
 enum {
     VK_CMD_RING_SIZE          = 8U,
-    VK_STAGE_MAX_BYTES        = 16U * 1024U * 1024U,
+    VK_MAPPED_IO_MAX_BYTES    = 256U * 1024U, /* Limit use of CPU-visible device memory. */
+    VK_STAGE_MAX_BYTES        = 4U * 1024U * 1024U,
     VK_MAX_PC_BYTES           = 128U,
     VK_MAX_DISPATCH_STAGES    = 3U,
     VK_MIN_BUF_ALIGN_BYTES    = 16U,
     VK_GEMM_F32_SMEM_BYTES    = 2U * 2U * 8U * 33U * 16U, /* 16896 B */
     VK_COOPMAT_128_SMEM_BYTES = 2U * 128U * 5U * 16U,     /* 20480 B */
     VK_TARGET_WGS             = 140U,
+    VK_SHORT_GEMM_TARGET_WGS  = 512U,
+    VK_MIXED_GEMM_MIN_ROWS    = 64U,
     VK_GEMV_WG_SIZE           = 128U,
+    VK_ROW_WG_SIZE            = 256U,
     VK_SPLITKV_MIN_KV_LEN     = 256U,
-    VK_SPLITKV_MAX_SPLITS     = 16U,
-    VK_SPLITKV_BUCKETS        = 4U,    /* Power-of-2 buckets: {2, 4, 8, 16} */
+    VK_SPLITKV_TILE_MIN_KV_LEN = 128U,
+    VK_SPLITKV_SLICED_MIN_KV_LEN = 257U,
+    VK_SPLITKV_MAX_SPLITS     = 64U,
+    VK_SPLITKV_BUCKETS        = 6U,    /* Power-of-2 buckets: {2, 4, 8, 16, 32, 64} */
     VK_STEP_SLAB_SLOTS        = 1024U, /* 64 KiB shared host-BDA slab = 1024 captured batches */
     VK_ENC_SCRATCH_INIT_CAP   = 2048U
 };
@@ -55,7 +62,10 @@ enum {
     VK_CAP_BF16_EXT = 1U << 4,
     VK_CAP_CM_F16   = 1U << 5,
     VK_CAP_CM_BF16  = 1U << 6,
-    VK_CAP_CM_I8    = 1U << 7
+    VK_CAP_CM_I8    = 1U << 7,
+    VK_CAP_F16_KV   = 1U << 8,
+    VK_CAP_SHARED_32K = 1U << 9,
+    VK_CAP_NV_ATTENTION = 1U << 10
 };
 
 enum {
@@ -77,25 +87,51 @@ enum {
     PIPE_FWHT_F32,
     PIPE_QUANTIZE_ROW_F32_I8,
     PIPE_GEMV_F32,
+    PIPE_QKV_ROPE_CACHE_F32,
+    PIPE_QKV_ROPE_CACHE_F16KV,
+    PIPE_RMS_QKV_F32,
+    PIPE_RMS_QKV_F16KV,
+    PIPE_RMS_GATED_GEMV_F32,
+    PIPE_GATED_GEMV_F32,
+    PIPE_GEMV_RESIDUAL_F32,
     PIPE_GEMV_F16,
     PIPE_GEMV_BF16,
     PIPE_GEMV_W8A8,
     PIPE_GEMM_F32,
+    PIPE_GEMM_SHORT_F32,
+    PIPE_GEMV_ROWS_F32,
     PIPE_SPLITK_REDUCE,
     PIPE_GEMM_COOPMAT_F16,
     PIPE_GEMM_COOPMAT_BF16,
     PIPE_GEMM_COOPMAT_W8A8,
     PIPE_GEMM_COOPMAT_F16_64,
+    PIPE_GEMM_F32_AS_F16,
     PIPE_GEMM_COOPMAT_BF16_64,
     PIPE_GEMM_COOPMAT_W8A8_64,
     PIPE_EMBEDDING_F32,
     PIPE_COPY_LAST_ROW_F32,
     PIPE_KV_APPEND_F32,
+    PIPE_KV_APPEND_F16KV,
     PIPE_ATTENTION_DECODE_F32,
+    PIPE_ATTENTION_DECODE_F16KV,
     PIPE_ATTENTION_PREFILL_F32,
+    PIPE_ATTENTION_PREFILL_F16KV,
+    PIPE_FLASH_ATTENTION_F32,
+    PIPE_FLASH_ATTENTION_F16KV,
+    PIPE_PREFILL_COOP_F16KV,
+    PIPE_PREFILL_COOP_HALF_F16KV,
+    PIPE_PREFILL_COOP_NV_F16KV,
+    PIPE_PREFILL_TILE_F32,
+    PIPE_PREFILL_SPLIT_F32,
+    PIPE_PREFILL_SPLIT_F16KV,
+    PIPE_PREFILL_MERGE_F32,
     PIPE_ATTENTION_WIDE_F32,
+    PIPE_ATTENTION_WIDE_F16KV,
     PIPE_ATTENTION_SPLITKV_F32,
+    PIPE_ATTENTION_SPLITKV_F16KV,
     PIPE_ATTENTION_SPLITKV_REDUCE_F32,
+    PIPE_ATTENTION_GROUPED_F16KV,
+    PIPE_ATTENTION_MERGE64_F32,
     PIPE_BATCHED_LINEAR_NT_F32,
     PIPE_BATCHED_LINEAR_NN_F32,
     PIPE_COUNT
@@ -168,6 +204,7 @@ typedef struct {
     VkDeviceMemory memory;
     VkDeviceAddress bda;
     size_t size;
+    void *host_map; /* Persistent host mapping for writable slot IO or cached readback. */
 } vk_buf;
 
 typedef struct vk_step_slab {
@@ -191,21 +228,23 @@ struct velri_completion {
 struct velri_captured_graph {
     VkCommandPool pool;
     VkCommandBuffer cmd;
-    VkCommandBuffer splitkv_cmds[VK_SPLITKV_BUCKETS]; /* Pre-recorded buckets for n_splits={2,4,8,16} */
+    VkCommandBuffer splitkv_cmds[VK_SPLITKV_BUCKETS]; /* Pre-recorded buckets for n_splits={2,4,8,16,32,64} */
     VkFence fence;
     struct velri_completion comp;
     vk_step_slab *step_slab;
     uint32_t step_slot;
     VkDeviceAddress step_bda;
     vk_gpu_step_params *step_map;
+    vk_buf *readback; /* Private coherent staging for the final batch of this slot. */
     bool splitkv_possible;
     bool splitkv_uniform;
-    uint32_t splitkv_min_kv_pos;
+    uint32_t splitkv_min_len;
     uint32_t splitkv_nh;
     uint32_t splitkv_dv;
     uint32_t splitkv_max_ctx;
     uint32_t splitkv_sw;
     uint32_t splitkv_max_splits;
+    uint32_t splitkv_limit;
     uint64_t splitkv_buf_gen;
     bool require_explicit_pos_offset;
     uint32_t default_pos_offset;
@@ -220,6 +259,7 @@ struct velri_prepared_op {
     int alt_pipe_id;                /* LINEAR: GEMV pipeline for dynamic active_rows <= 2 */
     int reduce_pipe_id;             /* LINEAR Split-K: PIPE_SPLITK_REDUCE */
     int stage2_decode_pipe_id;      /* ATTENTION: stage 2 decode/wide pipeline */
+    bool flash_prefill;             /* Eligible layout; final addresses checked when encoding. */
     int stage2_prefill_pipe_id;     /* ATTENTION: PIPE_ATTENTION_PREFILL_F32 */
     int stage2_splitkv_pipe_id;     /* ATTENTION: PIPE_ATTENTION_SPLITKV_F32 */
     int stage3_splitkv_reduce_pipe_id; /* ATTENTION: PIPE_ATTENTION_SPLITKV_REDUCE_F32 */
@@ -240,12 +280,30 @@ typedef struct {
     alignas(8) uint8_t pc[VK_MAX_PC_BYTES];
 } vk_dispatch_stage;
 
+static inline void set_dispatch_stage(vk_dispatch_stage *st, VkPipeline pipe, const void *pc,
+                               size_t pc_size, uint32_t gx, uint32_t gy, uint32_t gz) {
+    st->pipe = pipe;
+    st->gx = gx;
+    st->gy = gy;
+    st->gz = gz;
+    st->pc_size = (uint32_t)pc_size;
+    memcpy(st->pc, pc, pc_size);
+}
+
 typedef struct {
     vk_dispatch_stage stages[VK_MAX_DISPATCH_STAGES];
     uint32_t num_stages;
     vk_splitk_kind splitk_kind;
     size_t splitk_bytes;
 } vk_encoded_dispatch;
+
+typedef struct {
+    VkBool32 shader_int16;
+    VkBool32 storage_16bit;
+    VkBool32 storage_8bit;
+    VkBool32 shader_float16;
+    VkBool32 shader_int8;
+} vk_probed_feats;
 
 struct velri_backend_device {
     vk_inst_loader inst;
@@ -293,7 +351,33 @@ struct velri_backend_device {
     /* Pre-allocated batch-encoding scratch under `mtx` (eliminates stack cap & hot-path allocs). */
     vk_encoded_dispatch *enc_scratch;
     uint32_t enc_scratch_cap;
+    vk_probed_feats features;
 };
+
+static inline bool velri_vk_mixed_gemm_fits(const velri_backend_device *dev, uint32_t rows,
+                                             uint32_t cols) {
+    return rows >= VK_MIXED_GEMM_MIN_ROWS &&
+           velri_div_ceil_u32(cols, 64U) <= dev->max_wg_count[0] &&
+           velri_div_ceil_u32(rows, 64U) <= dev->max_wg_count[1];
+}
+
+static inline bool velri_vk_f16kv_coop_fits(const velri_backend_device *dev,
+                                            const velri_resolved_op *op, uint32_t rows) {
+    const velri_tensor_view *q = &op->inputs[0], *k = &op->outputs[1], *v = &op->outputs[2];
+    uint32_t window = op->raw.attr.attention.sliding_window;
+    return rows >= 64U && dev->subgroup_size == 32U &&
+           k->dtype == VELRI_DTYPE_F16 && op->raw.attr.attention.head_dim == 64U &&
+           velri_op_attn_dv(op) == 64U && k->dims[1] >= 16U && k->dims[1] <= UINT32_MAX - 256U &&
+           (window == 0U || window >= 512U) && (q->strides[0] & 3U) == 0U &&
+           ((k->strides[0] | k->strides[1] | v->strides[0] | v->strides[1]) & 7U) == 0U;
+}
+
+// The NV matrix loads consume complete 32-row KV and query tiles.
+static inline bool velri_vk_nv_prefill_shape(const velri_resolved_op *op) {
+    size_t capacity = op->outputs[1].dims[1];
+    return capacity >= 1536U && (capacity & 31U) == 0U &&
+           op->raw.attr.attention.causal && !op->raw.attr.attention.sliding_window;
+}
 
 /* ---- Cross-TU Vulkan Backend Functions ---- */
 
@@ -303,6 +387,7 @@ velri_status velri_vk_open_device(uint32_t local_index, const void *cfg,
                                   velri_backend_device **out_dev);
 velri_status velri_vk_query_caps(const velri_backend_device *dev, velri_device_caps *out_caps);
 void velri_vk_close_device(velri_backend_device *dev);
+velri_status velri_vk_activate_locked(velri_backend_device *dev);
 velri_status velri_vk_init_cmd_slot(velri_backend_device *dev, VkCommandPool *out_pool,
                                     VkCommandBuffer *out_cmd, VkFence *out_fence);
 
@@ -310,6 +395,10 @@ velri_status velri_vk_init_cmd_slot(velri_backend_device *dev, VkCommandPool *ou
 velri_status velri_vk_alloc_buf_locked(velri_backend_device *dev, size_t bytes, size_t align,
                                        vk_buf **out_buf);
 void velri_vk_free_buf_locked(velri_backend_device *dev, vk_buf *b);
+velri_status velri_vk_alloc_io(velri_backend_device *dev, size_t bytes, size_t align, void **out);
+void velri_vk_record_readback(velri_backend_device *dev, VkCommandBuffer cmd, VkBuffer src,
+                              velri_io_range range, VkBuffer dst);
+velri_status velri_vk_alloc_readback_locked(velri_backend_device *dev, size_t bytes, vk_buf **out);
 velri_status velri_vk_alloc_host_bda_locked(velri_backend_device *dev, size_t bytes,
                                             VkBuffer *out_buf, VkDeviceMemory *out_mem,
                                             VkDeviceAddress *out_bda, void **out_map);
@@ -329,6 +418,9 @@ velri_status velri_vk_copy_from_ram(velri_backend_device *dev, const velri_buffe
 velri_status velri_vk_zero_mem(velri_backend_device *dev, void *mem_handle, size_t bytes);
 
 /* vk_pipeline.c */
+uint32_t velri_vk_fuse_decode(velri_backend_device *dev, const velri_submit_item *items,
+                              const vk_encoded_dispatch *encoded, uint32_t count,
+                              vk_encoded_dispatch *out);
 VkPipeline velri_vk_get_pipe_locked(velri_backend_device *dev, int id);
 bool velri_vk_splitk_layout(uint32_t sk, uint32_t rows, uint32_t m, uint32_t *out_part_stride,
                             size_t *out_bytes);
@@ -336,7 +428,19 @@ uint32_t velri_vk_choose_split_k(uint32_t rows, uint32_t m, uint32_t k, uint32_t
                                  uint32_t tile_n, uint32_t target_wgs, uint32_t bk_elems);
 bool velri_vk_splitkv_layout(uint32_t n_splits, uint32_t n_heads, uint32_t d_v,
                              uint32_t *out_part_stride, size_t *out_bytes);
-uint32_t velri_vk_choose_split_kv(uint32_t n_heads, uint32_t d_v, uint32_t kv_len);
+uint32_t velri_vk_prefill_splits(const velri_backend_device *dev, const velri_resolved_op *op,
+                                 uint32_t rows, uint32_t keys, size_t *out_bytes);
+uint32_t velri_vk_splitkv_min_len(const velri_backend_device *dev, const velri_resolved_op *op);
+/* Each group stays within the Q heads sharing one KV head. */
+static inline uint32_t velri_vk_decode_group_size(uint32_t queries_per_kv) {
+    if (queries_per_kv % 4U == 0U) return 4U;
+    if (queries_per_kv % 3U == 0U) return 3U;
+    return 1U;
+}
+
+uint32_t velri_vk_splitkv_limit(const velri_backend_device *dev, const velri_resolved_op *op);
+uint32_t velri_vk_choose_split_kv(uint32_t n_heads, uint32_t d_v, uint32_t kv_len,
+                                  uint32_t min_len, uint32_t split_limit);
 velri_status velri_vk_resolve_op_pipes(const velri_backend_device *dev, const velri_resolved_op *op,
                                        struct velri_prepared_op *out_plan);
 velri_status velri_vk_query_operation(const velri_backend_device *dev, const velri_resolved_op *op);

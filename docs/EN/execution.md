@@ -60,6 +60,9 @@ Large disk-backed tables (e.g., n-gram PLE tables; see [qwen4_exp.md](../../../d
 - **No anti-patterns:** `vkQueueWaitIdle` per operation is forbidden as a general execution model; a single completion object tracks a batch of commands rather than each individual `dispatch`.
 - **Mapped memory (`HOST_VISIBLE`):** `HOST_VISIBLE` alone guarantees neither fast CPU nor fast GPU access. Non-coherent memory requires proper `flush`/`invalidate` ranges aligned to `nonCoherentAtomSize`. Even on UMA or coherent memory, C atomics and `volatile` **do not replace** Vulkan synchronization and memory visibility rules.
 - **Direct access and zero-copy:** skipping copies on UMA or direct discrete-GPU reads from `HOST_VISIBLE` memory are opt-in paths selected only from memory properties and measurements.
+- Each active Vulkan device uses a transfer buffer of up to 4 MiB. Larger copies are submitted in chunks. The built-in backend lists secondary devices at context creation and opens their compute queues and transfer resources on first preparation or allocation.
+- For slot I/O arenas up to 256 KiB, Vulkan tries to map coherent, device-local memory. The CPU can then write input tokens directly before submitting compute. Larger arenas and devices where mapping fails use staged uploads. Readbacks always use a coherent staging buffer, preferably one cached by the CPU.
+- When the last Vulkan batch replays a captured graph, it can copy its outputs into a private CPU-cached buffer before signaling the same fence. The planner budgets the aligned span containing those outputs, up to 256 KiB per slot. Larger spans and devices without a suitable allocation use the regular staged copy.
 - **Command buffer reuse:** command buffers are reused only with compatible resource bindings and safe slot lifetimes (Vulkan command reuse does not promise CUDA Graphs update semantics).
 
 ---

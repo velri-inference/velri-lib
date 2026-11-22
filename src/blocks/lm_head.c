@@ -61,7 +61,8 @@ velri_tensor velri_block_lm_head(velri_builder *b, velri_tensor x, const velri_l
 
     /* Slice the final active sequence row on `x.device_id` before entering `lm-head` scope
      * unless full-sequence logits were explicitly requested. */
-    velri_tensor h = spec->full_seq_logits ? x : velri_b_copy_last_row(b, x);
+    bool single_row = !x.is_seq_dynamic && x.dims[0] == 1U;
+    velri_tensor h = (spec->full_seq_logits || single_row) ? x : velri_b_copy_last_row(b, x);
     if (b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }

@@ -30,16 +30,6 @@ static inline uint32_t grid_x_vec4_256(uint32_t count) {
     return velri_div_ceil_u32(velri_div_ceil_u32(count, 4U), 256U);
 }
 
-static void set_dispatch_stage(vk_dispatch_stage *st, VkPipeline pipe, const void *pc,
-                               size_t pc_size, uint32_t gx, uint32_t gy, uint32_t gz) {
-    st->pipe = pipe;
-    st->gx = gx;
-    st->gy = gy;
-    st->gz = gz;
-    st->pc_size = (uint32_t)pc_size;
-    memcpy(st->pc, pc, pc_size);
-}
-
 static velri_status encode_item_locked(velri_backend_device *dev, const velri_submit_item *item,
                                        uint64_t step_params_bda, bool allow_splitk,
                                        uint32_t force_splitkv, vk_encoded_dispatch *out) {
@@ -104,7 +94,26 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         if (rows <= 2U && plan.alt_pipe_id >= 0) {
             active_pipe_id = plan.alt_pipe_id;
         }
-        pipe0 = velri_vk_get_pipe_locked(dev, active_pipe_id);
+        if (active_pipe_id == PIPE_GEMM_F32 && op->raw.attr.linear.allow_f16_matmul &&
+            dev->pipes[PIPE_GEMM_F32_AS_F16] && velri_vk_mixed_gemm_fits(dev, rows, m)) {
+            active_pipe_id = PIPE_GEMM_F32_AS_F16;
+        }
+        if (active_pipe_id == PIPE_GEMM_F32 && rows >= 3U && rows <= 64U) {
+            const bool vector_inputs = !((ib[0] | ib[1]) & 15U) && !((k | xs | ws) & 3U);
+            int prompt_pipe = active_pipe_id;
+            if (rows <= 16U) {
+                prompt_pipe = vector_inputs ? PIPE_GEMV_ROWS_F32 : PIPE_GEMV_F32;
+            } else if (vector_inputs && k % 16U == 0U) {
+                prompt_pipe = PIPE_GEMM_SHORT_F32;
+            }
+            const uint32_t cols_per_group = rows <= 16U ? warps_per_wg : 64U;
+            if (prompt_pipe != active_pipe_id &&
+                velri_div_ceil_u32(m, cols_per_group) <= dev->max_wg_count[0]) {
+                pipe0 = dev->pipes[prompt_pipe];
+                if (pipe0) active_pipe_id = prompt_pipe;
+            }
+        }
+        if (!pipe0) pipe0 = velri_vk_get_pipe_locked(dev, active_pipe_id);
         if (!pipe0) {
             return VELRI_ERR_UNSUPPORTED;
         }
@@ -126,12 +135,24 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .split_k = 1U,
         };
 
+        /* Bias is optional. Keep masked reads of the two prompt shaders inside a
+         * valid F32 allocation on software Vulkan subgroup implementations. */
+        if (!args.bias && (active_pipe_id == PIPE_GEMV_ROWS_F32 ||
+                           active_pipe_id == PIPE_GEMM_SHORT_F32)) {
+            args.bias = args.w;
+        }
+
         uint32_t gx = 1U, gy = 1U, gz = 1U;
-        if (active_pipe_id == PIPE_GEMV_F32 || active_pipe_id == PIPE_GEMV_F16 ||
-            active_pipe_id == PIPE_GEMV_BF16 || active_pipe_id == PIPE_GEMV_W8A8) {
+        if (active_pipe_id == PIPE_GEMV_ROWS_F32) {
+            gx = velri_div_ceil_u32(m, warps_per_wg);
+            gy = velri_div_ceil_u32(rows, 4U);
+        } else if (active_pipe_id == PIPE_GEMV_F32 || active_pipe_id == PIPE_GEMV_F16 ||
+                   active_pipe_id == PIPE_GEMV_BF16 || active_pipe_id == PIPE_GEMV_W8A8) {
             gx = velri_div_ceil_u32(m, warps_per_wg);
             gy = rows;
-        } else if (active_pipe_id == PIPE_GEMM_COOPMAT_F16_64 ||
+        } else if (active_pipe_id == PIPE_GEMM_SHORT_F32 ||
+                   active_pipe_id == PIPE_GEMM_F32_AS_F16 ||
+                   active_pipe_id == PIPE_GEMM_COOPMAT_F16_64 ||
                    active_pipe_id == PIPE_GEMM_COOPMAT_BF16_64 ||
                    active_pipe_id == PIPE_GEMM_COOPMAT_W8A8_64) {
             gx = velri_div_ceil_u32(m, 64U);
@@ -142,9 +163,13 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         }
 
         out->num_stages = 1U;
-        if (allow_splitk && active_pipe_id == PIPE_GEMM_F32 && plan.split_k > 1U &&
-            plan.reduce_pipe_id >= 0) {
-            uint32_t sk = velri_vk_choose_split_k(rows, m, k, 128U, 128U, VK_TARGET_WGS, 8U);
+        const bool short_tile = active_pipe_id == PIPE_GEMM_SHORT_F32;
+        if (allow_splitk && (active_pipe_id == PIPE_GEMM_F32 || short_tile) &&
+            plan.split_k > 1U && plan.reduce_pipe_id >= 0) {
+            uint32_t sk = short_tile
+                              ? velri_vk_choose_split_k(rows, m, k, 64U, 64U,
+                                                        VK_SHORT_GEMM_TARGET_WGS, 16U)
+                              : velri_vk_choose_split_k(rows, m, k, 128U, 128U, VK_TARGET_WGS, 8U);
             if (sk > plan.split_k) {
                 sk = plan.split_k;
             }
@@ -501,6 +526,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         }
         uint32_t nh = op->raw.attr.attention.n_heads;
         uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
+        uint32_t min_len = velri_vk_splitkv_min_len(dev, op);
         uint32_t same_kv = (ob[1] == ob[2]) ? 1U : 0U;
 
         vk_kv_append_args s1 = {
@@ -533,7 +559,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             plan.stage3_splitkv_reduce_pipe_id >= 0) {
             uint32_t sw = op->raw.attr.attention.sliding_window;
             uint32_t eff_max_kv = (sw > 0U && sw < aa.max_ctx) ? sw : aa.max_ctx;
-            uint32_t n_splits = (force_splitkv > 0U && eff_max_kv >= VK_SPLITKV_MIN_KV_LEN)
+            uint32_t n_splits = (force_splitkv > 0U && eff_max_kv >= min_len)
                                     ? force_splitkv
                                     : 0U;
             if (n_splits == 0U && force_splitkv == 0U && step_params_bda == 0ULL) {
@@ -541,16 +567,27 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
                 uint32_t kv_end =
                     (kv_end64 < (uint64_t)aa.max_ctx) ? (uint32_t)kv_end64 : aa.max_ctx;
                 uint32_t eff_kv_len = (sw > 0U && kv_end > sw) ? sw : kv_end;
-                n_splits = velri_vk_choose_split_kv(nh, aa.d_v, eff_kv_len);
+                n_splits = velri_vk_choose_split_kv(nh, aa.d_v, eff_kv_len, min_len,
+                                                  velri_vk_splitkv_limit(dev, op));
+            }
+            uint32_t group_heads = 1U;
+            if (n_splits == 64U) {
+                if (!((ib[0] | ob[1] | ob[2]) & 15U) && velri_vk_splitkv_limit(dev, op) == 64U &&
+                    dev->pipes[PIPE_ATTENTION_GROUPED_F16KV] && dev->pipes[PIPE_ATTENTION_MERGE64_F32]) {
+                    group_heads = velri_vk_decode_group_size(nh / nkvh);
+                }
+                if (group_heads == 1U) n_splits = 32U;
             }
             uint32_t part_stride = 0U;
             size_t need_bytes = 0U;
             if (n_splits > 1U &&
                 velri_vk_splitkv_layout(n_splits, nh, aa.d_v, &part_stride, &need_bytes) &&
                 dev->splitk_buf && dev->splitk_buf->size >= need_bytes) {
-                VkPipeline pipe_skv = velri_vk_get_pipe_locked(dev, plan.stage2_splitkv_pipe_id);
+                VkPipeline pipe_skv = velri_vk_get_pipe_locked(dev, group_heads > 1U ? PIPE_ATTENTION_GROUPED_F16KV
+                                                                                     : plan.stage2_splitkv_pipe_id);
                 VkPipeline pipe_red =
-                    velri_vk_get_pipe_locked(dev, plan.stage3_splitkv_reduce_pipe_id);
+                    velri_vk_get_pipe_locked(dev, group_heads > 1U ? PIPE_ATTENTION_MERGE64_F32
+                                                                     : plan.stage3_splitkv_reduce_pipe_id);
                 if (pipe_skv != VK_NULL_HANDLE && pipe_red != VK_NULL_HANDLE) {
                     vk_split_kv_args s2 = {
                         .q = ib[0],
@@ -572,7 +609,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
                         .sliding_window = sw,
                         .causal = op->raw.attr.attention.causal ? 1U : 0U,
                         .n_splits = n_splits,
-                        .pad = 0U,
+                        .group_heads = group_heads,
                         .scale = aa.scale,
                     };
                     vk_split_kv_reduce_args s3 = {
@@ -583,9 +620,13 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
                         .part_stride = part_stride,
                         .n_splits = n_splits,
                     };
-                    set_dispatch_stage(&out->stages[1], pipe_skv, &s2, sizeof(s2), nh, n_splits,
+                    set_dispatch_stage(&out->stages[1], pipe_skv, &s2, sizeof(s2), nh / group_heads, n_splits,
                                        1U);
-                    set_dispatch_stage(&out->stages[2], pipe_red, &s3, sizeof(s3), nh, 1U, 1U);
+                    if (dev->subgroup_size == 32U && aa.d_v % 8U == 0U) {
+                        s3.value_slices = aa.d_v / (n_splits >= 32U ? 4U : 8U);
+                    }
+                    set_dispatch_stage(&out->stages[2], pipe_red, &s3, sizeof(s3), nh,
+                                       s3.value_slices ? s3.value_slices : 1U, 1U);
                     out->num_stages = 3U;
                     out->splitk_kind = VK_SPLITK_ATTN;
                     out->splitk_bytes = need_bytes;
@@ -596,7 +637,16 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
 
         int s2_pipe_id =
             (aa.active_t == 1U) ? plan.stage2_decode_pipe_id : plan.stage2_prefill_pipe_id;
-        VkPipeline pipe2 = velri_vk_get_pipe_locked(dev, s2_pipe_id);
+        // Several query rows reuse each key and value. Small grids favor one workgroup per row.
+        bool flash = plan.flash_prefill && aa.active_t >= 128U &&
+                     ((ib[0] | ob[1] | ob[2]) & 15U) == 0U;
+        const bool f16 = op->outputs[1].dtype == VELRI_DTYPE_F16;
+        const bool decode = s2_pipe_id == PIPE_ATTENTION_DECODE_F32 || s2_pipe_id == PIPE_ATTENTION_DECODE_F16KV;
+        VkPipeline pipe2 = flash ? dev->pipes[f16 ? PIPE_FLASH_ATTENTION_F16KV : PIPE_FLASH_ATTENTION_F32] : VK_NULL_HANDLE;
+        if (!pipe2) {
+            flash = false;
+            pipe2 = velri_vk_get_pipe_locked(dev, s2_pipe_id);
+        }
         if (!pipe2) {
             return VELRI_ERR_UNSUPPORTED;
         }
@@ -623,8 +673,67 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .causal = op->raw.attr.attention.causal ? 1U : 0U,
             .scale = aa.scale,
         };
-        uint32_t gx2 = (s2_pipe_id == PIPE_ATTENTION_DECODE_F32) ? nh : aa.active_t;
-        uint32_t gy2 = (s2_pipe_id == PIPE_ATTENTION_DECODE_F32) ? 1U : nh;
+        // Short cooperative grids become worthwhile once they have a resident history to scan.
+        bool mixed = op->raw.attr.attention.allow_f16_matmul && dev->pipes[PIPE_PREFILL_COOP_HALF_F16KV];
+        VkPipeline cooperative = dev->pipes[mixed ? PIPE_PREFILL_COOP_HALF_F16KV : PIPE_PREFILL_COOP_F16KV];
+        bool use_cooperative = cooperative && velri_vk_f16kv_coop_fits(dev, op, aa.active_t) &&
+                               ((ib[0] | ob[1] | ob[2]) & 15U) == 0U &&
+                               (aa.active_t >= (mixed ? 128U : 512U) ||
+                                (!step_params_bda && aa.kv_pos >= 256U));
+        if (!use_cooperative && allow_splitk && !step_params_bda &&
+            (s2_pipe_id == PIPE_ATTENTION_PREFILL_F32 || s2_pipe_id == PIPE_ATTENTION_PREFILL_F16KV) &&
+            ((ib[0] | ob[1] | ob[2]) & 15U) == 0U) {
+            uint64_t end = (uint64_t)aa.kv_pos + aa.active_t;
+            size_t bytes = 0U;
+            uint32_t splits = velri_vk_prefill_splits(dev, op, aa.active_t,
+                end < aa.max_ctx ? (uint32_t)end : aa.max_ctx, &bytes);
+            if (splits && dev->splitk_buf && dev->splitk_buf->size >= bytes) {
+                VkPipeline partial = dev->pipes[f16 ? PIPE_PREFILL_SPLIT_F16KV : PIPE_PREFILL_SPLIT_F32];
+                VkPipeline reduce = dev->pipes[PIPE_PREFILL_MERGE_F32];
+                if (partial && reduce) {
+                    vk_prefill_merge_args merge = {
+                        .partials = dev->splitk_buf->bda, .output = s2.y, .row_heads = aa.active_t * nh,
+                        .heads = nh, .output_stride = s2.o_stride, .splits = splits,
+                    };
+                    s2.y = merge.partials;
+                    s2.value_slices = splits;
+                    set_dispatch_stage(&out->stages[1], partial, &s2, sizeof(s2),
+                                       velri_div_ceil_u32(aa.active_t, 32U), nh, splits);
+                    set_dispatch_stage(&out->stages[2], reduce, &merge, sizeof(merge),
+                                       velri_div_ceil_u32(merge.row_heads, 8U), 1U, 1U);
+                    out->num_stages = 3U;
+                    out->splitk_kind = VK_SPLITK_ATTN;
+                    out->splitk_bytes = bytes;
+                    break;
+                }
+            }
+        }
+        uint32_t gx2 = decode ? nh : aa.active_t;
+        uint32_t gy2 = decode ? 1U : nh;
+        if (decode && min_len == VK_SPLITKV_SLICED_MIN_KV_LEN &&
+            ib[0] != ob[0] && ((ib[0] | ib[1] | ib[2] | ob[1] | ob[2]) & 15U) == 0U) {
+            s2.value_slices = aa.d_v / 8U;
+            gy2 = s2.value_slices;
+        }
+        if (use_cooperative) {
+            pipe2 = cooperative;
+            gx2 = velri_div_ceil_u32(aa.active_t, 16U);
+            // The wider query tile reuses KV across two MMA tiles at long prefixes.
+            // Its unmasked matrix loads require complete query and cache tiles.
+            if (mixed && !step_params_bda && aa.kv_pos >= 1024U && aa.active_t >= 512U &&
+                (aa.active_t & 31U) == 0U && velri_vk_nv_prefill_shape(op) &&
+                dev->pipes[PIPE_PREFILL_COOP_NV_F16KV]) {
+                pipe2 = dev->pipes[PIPE_PREFILL_COOP_NV_F16KV];
+                gx2 = aa.active_t / 32U;
+            }
+        } else if (flash) {
+            gx2 = velri_div_ceil_u32(aa.active_t, aa.d_k == 128U ? 2U : 4U);
+            if (!f16 && aa.active_t >= 512U && aa.d_k == 64U &&
+                (!s2.sliding_window || s2.sliding_window >= 512U) && dev->pipes[PIPE_PREFILL_TILE_F32]) {
+                pipe2 = dev->pipes[PIPE_PREFILL_TILE_F32];
+                gx2 = velri_div_ceil_u32(aa.active_t, 16U);
+            }
+        }
         set_dispatch_stage(&out->stages[1], pipe2, &s2, sizeof(s2), gx2, gy2, 1U);
         out->num_stages = 2U;
         break;
@@ -730,6 +839,25 @@ static velri_status ensure_enc_scratch_locked(velri_backend_device *dev, uint32_
     return VELRI_OK;
 }
 
+/* If another fused projection already appends K/V, its first stage is a different pipeline.
+ * The following sliced attention then reads the cache without writing the token a second time. */
+static bool combine_sliced_append(const velri_backend_device *dev, const vk_encoded_dispatch *enc,
+                                  vk_dispatch_stage *stage) {
+    if (enc->num_stages != 2U || enc->stages[0].pipe != dev->pipes[PIPE_KV_APPEND_F32] ||
+        enc->stages[1].pipe != dev->pipes[PIPE_ATTENTION_DECODE_F32] || enc->stages[1].gy == 1U) {
+        return false;
+    }
+    vk_kv_append_args append;
+    vk_attention_args attention;
+    memcpy(&append, enc->stages[0].pc, sizeof(append));
+    memcpy(&attention, enc->stages[1].pc, sizeof(attention));
+    attention.k_new = append.k_in;
+    attention.v_new = append.v_in;
+    *stage = enc->stages[1];
+    memcpy(stage->pc, &attention, sizeof(attention));
+    return true;
+}
+
 static void record_encoded_batch(velri_backend_device *dev, VkCommandBuffer cmd,
                                  const velri_submit_item *items, const vk_encoded_dispatch *enc,
                                  uint32_t count) {
@@ -739,17 +867,24 @@ static void record_encoded_batch(velri_backend_device *dev, VkCommandBuffer cmd,
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
     };
 
+    bool previous_fused = false;
     bool any_dispatched = false;
     bool splitk_dirty = false;
     for (uint32_t i = 0U; i < count; ++i) {
-        bool item_uses_sk = (enc[i].splitk_kind != VK_SPLITK_NONE);
-        for (uint32_t s = 0U; s < enc[i].num_stages; ++s) {
-            const vk_dispatch_stage *ds = &enc[i].stages[s];
+        vk_encoded_dispatch combined;
+        const uint32_t consumed = velri_vk_fuse_decode(dev, &items[i], &enc[i], count - i, &combined);
+        const vk_encoded_dispatch *active = consumed ? &combined : &enc[i];
+        bool item_uses_sk = (active->splitk_kind != VK_SPLITK_NONE);
+        vk_dispatch_stage sliced;
+        bool inline_append = combine_sliced_append(dev, active, &sliced);
+        uint32_t stages = inline_append ? 1U : active->num_stages;
+        for (uint32_t s = 0U; s < stages; ++s) {
+            const vk_dispatch_stage *ds = inline_append ? &sliced : &active->stages[s];
             bool need_bar = false;
             if (s > 0U) {
                 need_bar = true;
             } else if (any_dispatched) {
-                if (!items[i].no_barrier_before || (item_uses_sk && splitk_dirty)) {
+                if (consumed || previous_fused || !items[i].no_barrier_before || (item_uses_sk && splitk_dirty)) {
                     need_bar = true;
                 }
             }
@@ -764,6 +899,10 @@ static void record_encoded_batch(velri_backend_device *dev, VkCommandBuffer cmd,
                                     ds->pc_size, ds->pc);
             dev->vkCmdDispatch(cmd, ds->gx, ds->gy, ds->gz);
             any_dispatched = true;
+        }
+        previous_fused = consumed != 0U;
+        if (consumed) {
+            i += consumed - 1U;
         }
         if (item_uses_sk) {
             splitk_dirty = true;
@@ -920,6 +1059,7 @@ static void free_captured_graph_locked(velri_backend_device *dev, velri_captured
     if (cg->pool) {
         dev->vkDestroyCommandPool(dev->device, cg->pool, nullptr);
     }
+    velri_vk_free_buf_locked(dev, cg->readback);
     free(cg);
 }
 
@@ -933,17 +1073,30 @@ static uint32_t splitkv_bucket_index(uint32_t n_splits) {
         return 2U;
     case 16U:
         return 3U;
+    case 32U:
+        return 4U;
+    case 64U:
+        return 5U;
     default:
         return VK_SPLITKV_BUCKETS;
     }
 }
 
-static velri_status vk_capture_graph(velri_backend_device *dev, const velri_submit_item *items,
-                                     uint32_t count, velri_captured_graph **out_graph) {
+static void record_output_readback(velri_backend_device *dev, VkCommandBuffer cmd,
+                                   const vk_buf *source, velri_io_range range, const vk_buf *dst) {
+    if (dst) velri_vk_record_readback(dev, cmd, source->buffer, range, dst->buffer);
+}
+
+static velri_status vk_capture_outputs(velri_backend_device *dev, const velri_submit_item *items,
+                                       uint32_t count, void *io_arena, velri_io_range range,
+                                       const void **out_readback, velri_captured_graph **out_graph) {
     if (!dev || !items || count == 0U || !out_graph) {
         return VELRI_ERR_INVALID;
     }
     *out_graph = nullptr;
+    if (out_readback) {
+        *out_readback = nullptr;
+    }
 
     velri_captured_graph *cg = (velri_captured_graph *)calloc(1U, sizeof(*cg));
     if (!cg) {
@@ -1041,23 +1194,29 @@ static velri_status vk_capture_graph(velri_backend_device *dev, const velri_subm
                 uint32_t nh = op->raw.attr.attention.n_heads;
                 uint32_t sw = op->raw.attr.attention.sliding_window;
                 uint32_t eff_max_kv = (sw > 0U && sw < max_ctx) ? sw : max_ctx;
-                uint32_t max_sp = velri_vk_choose_split_kv(nh, dv, eff_max_kv);
+                uint32_t min_len = velri_vk_splitkv_min_len(dev, op);
+                uint32_t split_limit = velri_vk_splitkv_limit(dev, op);
+                uint32_t max_sp = velri_vk_choose_split_kv(nh, dv, eff_max_kv, min_len, split_limit);
                 size_t min_bytes = 0U;
                 if (max_sp > 1U &&
                     velri_vk_splitkv_layout(2U, nh, dv, nullptr, &min_bytes) &&
                     dev->splitk_buf && dev->splitk_buf->size >= min_bytes) {
                     cg->splitkv_possible = true;
-                    cg->splitkv_min_kv_pos = VK_SPLITKV_MIN_KV_LEN - 1U;
+
                     if (!seen_splitkv_attn) {
                         seen_splitkv_attn = true;
+                        cg->splitkv_min_len = min_len;
                         cg->splitkv_nh = nh;
                         cg->splitkv_dv = dv;
                         cg->splitkv_max_ctx = max_ctx;
                         cg->splitkv_sw = sw;
                         cg->splitkv_max_splits = max_sp;
+                        cg->splitkv_limit = split_limit;
                     } else if (cg->splitkv_nh != nh || cg->splitkv_dv != dv ||
-                               cg->splitkv_max_ctx != max_ctx || cg->splitkv_sw != sw) {
+                               cg->splitkv_max_ctx != max_ctx || cg->splitkv_sw != sw ||
+                               cg->splitkv_min_len != min_len || cg->splitkv_limit != split_limit) {
                         cg->splitkv_uniform = false;
+                        if (min_len < cg->splitkv_min_len) cg->splitkv_min_len = min_len;
                     }
                 }
             }
@@ -1074,15 +1233,21 @@ static velri_status vk_capture_graph(velri_backend_device *dev, const velri_subm
         velri_os_mutex_unlock(dev->mtx);
         return VELRI_ERR_EXEC;
     }
+    const vk_buf *source = (const vk_buf *)io_arena;
+    if (source && out_readback && range.bytes > 0U && range.offset <= source->size &&
+        range.bytes <= source->size - range.offset && range.bytes <= VK_MAPPED_IO_MAX_BYTES) {
+        (void)velri_vk_alloc_readback_locked(dev, range.bytes, &cg->readback);
+    }
     record_encoded_batch(dev, cg->cmd, items, enc, count);
+    record_output_readback(dev, cg->cmd, source, range, cg->readback);
     if (dev->vkEndCommandBuffer(cg->cmd) != VK_SUCCESS) {
         free_captured_graph_locked(dev, cg);
         velri_os_mutex_unlock(dev->mtx);
         return VELRI_ERR_EXEC;
     }
 
-    /* Pre-record bucketed Split-KV command buffers ({2,4,8,16}) on the SAME pool & step slot
-     * so long-context decode (kv_len >= 256) also runs with 0 host command recording! */
+    /* Pre-record bucketed Split-KV command buffers ({2,4,8,16,32}) on the SAME pool & step slot
+     * so split decode also runs without host command recording. */
     if (cg->splitkv_possible && cg->splitkv_uniform && cg->splitkv_max_splits >= 2U) {
         cg->splitkv_buf_gen = dev->splitk_buf_gen;
         for (uint32_t b = 0U; b < VK_SPLITKV_BUCKETS; ++b) {
@@ -1119,6 +1284,7 @@ static velri_status vk_capture_graph(velri_backend_device *dev, const velri_subm
                 break;
             }
             record_encoded_batch(dev, bcmd, items, enc, count);
+            record_output_readback(dev, bcmd, source, range, cg->readback);
             if (dev->vkEndCommandBuffer(bcmd) != VK_SUCCESS) {
                 break;
             }
@@ -1133,9 +1299,17 @@ static velri_status vk_capture_graph(velri_backend_device *dev, const velri_subm
     cg->comp.uses_splitk = false;
     cg->comp.is_captured_graph = true;
 
+    if (cg->readback) {
+        *out_readback = cg->readback->host_map;
+    }
     *out_graph = cg;
     velri_os_mutex_unlock(dev->mtx);
     return VELRI_OK;
+}
+
+static velri_status vk_capture_graph(velri_backend_device *dev, const velri_submit_item *items,
+                                     uint32_t count, velri_captured_graph **out_graph) {
+    return vk_capture_outputs(dev, items, count, nullptr, (velri_io_range){0}, nullptr, out_graph);
 }
 
 static void vk_destroy_captured_graph(velri_backend_device *dev, velri_captured_graph *graph) {
@@ -1182,7 +1356,7 @@ static velri_status vk_replay_graph(velri_backend_device *dev, velri_captured_gr
     uint32_t bucket = VK_SPLITKV_BUCKETS;
     if (graph->splitkv_possible) {
         if (!graph->splitkv_uniform) {
-            if (eff_kv >= graph->splitkv_min_kv_pos) {
+            if (eff_kv >= graph->splitkv_min_len - 1U) {
                 return VELRI_ERR_UNSUPPORTED;
             }
         } else {
@@ -1193,12 +1367,12 @@ static velri_status vk_replay_graph(velri_backend_device *dev, velri_captured_gr
             uint32_t eff_kv_len =
                 (graph->splitkv_sw > 0U && kv_end > graph->splitkv_sw) ? graph->splitkv_sw : kv_end;
             uint32_t want_sp =
-                velri_vk_choose_split_kv(graph->splitkv_nh, graph->splitkv_dv, eff_kv_len);
+                velri_vk_choose_split_kv(graph->splitkv_nh, graph->splitkv_dv, eff_kv_len,
+                                         graph->splitkv_min_len, graph->splitkv_limit);
             if (want_sp >= 2U) {
                 bucket = splitkv_bucket_index(want_sp);
-                if (bucket >= VK_SPLITKV_BUCKETS ||
-                    graph->splitkv_cmds[bucket] == VK_NULL_HANDLE) {
-                    return VELRI_ERR_UNSUPPORTED;
+                while (bucket < VK_SPLITKV_BUCKETS && !graph->splitkv_cmds[bucket]) {
+                    bucket = bucket > 0U ? bucket - 1U : VK_SPLITKV_BUCKETS;
                 }
             }
         }
@@ -1291,6 +1465,12 @@ static void vk_destroy_completion(velri_backend_device *dev, velri_completion *c
     }
     velri_os_mutex_unlock(dev->mtx);
 }
+
+const velri_device_hooks velri_vulkan_device_hooks = {
+    .alloc_io = velri_vk_alloc_io,
+    .max_readback_bytes = VK_MAPPED_IO_MAX_BYTES,
+    .capture_outputs = vk_capture_outputs,
+};
 
 static const velri_backend_vtable g_vk_vtable = {
     .name = "vulkan",

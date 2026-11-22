@@ -70,7 +70,27 @@ typedef struct {
 } velri_cpu_open_cfg;
 
 typedef struct {
+    bool defer_secondary_devices;
+} velri_vk_open_cfg;
+
+typedef velri_status (*velri_alloc_fn)(velri_backend_device *, size_t, size_t, void **);
+
+typedef struct {
+    size_t offset;
+    size_t bytes;
+} velri_io_range;
+
+typedef struct {
+    velri_alloc_fn alloc_io;
+    size_t max_readback_bytes;
+    velri_status (*capture_outputs)(velri_backend_device *dev, const velri_submit_item *items,
+                                    uint32_t count, void *io_arena, velri_io_range range,
+                                    const void **out_readback, velri_captured_graph **out_graph);
+} velri_device_hooks;
+
+typedef struct {
     const velri_backend_vtable *vt;
+    const velri_device_hooks *hooks;
     velri_backend_device *dev;
     velri_device_caps caps;
 } velri_device_entry;
@@ -88,7 +108,7 @@ struct velri_context {
 void velri_context_retain(velri_context *ctx);
 void velri_context_release(velri_context *ctx);
 velri_status velri_device_alloc_tracked(velri_context *ctx, velri_device_id dev_id, size_t bytes,
-                                        size_t align, void **out_handle);
+                                        size_t align, velri_arena_kind kind, void **out_handle);
 
 /* ---- Operation Graph ---- */
 
@@ -186,6 +206,7 @@ struct velri_plan {
     size_t slot_arena_bytes[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];
     size_t slot_arena_align[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];
     size_t ram_staging_bytes;
+    velri_io_range readback; /* Final batch output span and per-slot allocation budget. */
 
     velri_launch_step *steps;
     uint32_t num_steps;
@@ -202,6 +223,7 @@ void velri_plan_release(velri_plan *plan);
 
 #ifdef VELRI_CORE_HAS_VULKAN
 const velri_backend_vtable *velri_vulkan_backend_vtable(void);
+extern const velri_device_hooks velri_vulkan_device_hooks;
 #endif
 
 #endif /* VELRI_CORE_INTERNAL_H */

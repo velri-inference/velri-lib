@@ -32,7 +32,7 @@ void vk_embedding_f32(uniform EmbeddingArgs a, uint3 gtid : SV_GroupThreadID, ui
         valid = (raw_id >= 0) && (uint(raw_id) < a.vocab);
         idx = uint(raw_id);
     } else {
-        uint eff_pos = (a.step_params != nullptr) ? a.step_params[1] : a.pos_offset;
+        uint eff_pos = step_word_or(a.step_params, 1u, a.pos_offset, a.table);
         uint64_t pos64 = uint64_t(eff_pos) + uint64_t(row);
         valid = pos64 < uint64_t(a.vocab);
         idx = uint(pos64);

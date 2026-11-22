@@ -62,6 +62,12 @@ velri_tensor velri_layer_pre_norm(velri_builder *b, velri_tensor x, const char *
     }
 
     /* MLP sub-block: optional mlp_scope around norm2 + mlp + residual add. */
+    if (spec->last_row_only) {
+        x = velri_b_copy_last_row(b, x);
+        if (!x.valid) {
+            goto cleanup;
+        }
+    }
     if (spec->mlp_scope) {
         velri_b_push_scope(b, spec->mlp_scope);
         if (b->err != VELRI_OK) {
