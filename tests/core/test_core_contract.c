@@ -771,6 +771,308 @@ static void test_hybrid_cpu_vulkan(velri_context *ctx, velri_device_id cpu_dev) 
 }
 #endif
 
+/* ---- Test 9: Dual-Plan Shared WEIGHT Slabs & Shared STATE Arenas (0 Duplication) ---- */
+static void test_shared_weights_and_shared_state_dual_plan(velri_context *ctx,
+                                                           velri_device_id cpu_dev,
+                                                           velri_device_id mock_dev) {
+    const size_t n = 32U;
+    velri_graph *g_dec = nullptr, *g_pre = nullptr, *g_bad = nullptr;
+    CHECK_OK(velri_graph_create(&g_dec), "dual g_dec");
+    CHECK_OK(velri_graph_create(&g_pre), "dual g_pre");
+    CHECK_OK(velri_graph_create(&g_bad), "dual g_bad");
+
+    /* Both plans store WEIGHT and STATE on non-host `mock_dev`, but execute ops on different
+     * compute devices (`decode` on `cpu_dev`, `prefill` on `mock_dev`), exercising BOTH
+     * shared non-host weight slabs and shared resident state arenas across heterogeneous plans! */
+    velri_storage_id d_x = add_f32_storage(g_dec, VELRI_STORAGE_INPUT, n, cpu_dev);
+    velri_storage_id d_w = add_f32_storage(g_dec, VELRI_STORAGE_WEIGHT, n, mock_dev);
+    velri_storage_id d_s = add_f32_storage(g_dec, VELRI_STORAGE_STATE, n, mock_dev);
+    velri_storage_id d_tmp = add_f32_storage(g_dec, VELRI_STORAGE_SCRATCH, n, cpu_dev);
+    velri_storage_id d_y = add_f32_storage(g_dec, VELRI_STORAGE_OUTPUT, n, cpu_dev);
+    velri_view_id vd_x = add_1d_view(g_dec, d_x, n);
+    velri_view_id vd_w = add_1d_view(g_dec, d_w, n);
+    velri_view_id vd_s = add_1d_view(g_dec, d_s, n);
+    velri_view_id vd_tmp = add_1d_view(g_dec, d_tmp, n);
+    velri_view_id vd_y = add_1d_view(g_dec, d_y, n);
+    /* Decode: tmp = x * w; s = s + tmp; y = s */
+    velri_op_desc d_op0 = {
+        .kind = VELRI_OP_VEC_MUL, .num_inputs = 2U, .num_outputs = 1U,
+        .inputs = {vd_x, vd_w}, .outputs = {vd_tmp},
+    };
+    velri_op_desc d_op1 = {
+        .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 2U, .num_outputs = 1U,
+        .inputs = {vd_s, vd_tmp}, .outputs = {vd_s}, .attr.axpby = {.alpha = 1.0f, .beta = 1.0f},
+    };
+    velri_op_desc d_op2 = {
+        .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 1U, .num_outputs = 1U,
+        .inputs = {vd_s}, .outputs = {vd_y}, .attr.axpby = {.alpha = 1.0f, .beta = 0.0f},
+    };
+    CHECK_OK(velri_graph_add_op(g_dec, &d_op0, cpu_dev, nullptr), "d_op0");
+    CHECK_OK(velri_graph_add_op(g_dec, &d_op1, cpu_dev, nullptr), "d_op1");
+    CHECK_OK(velri_graph_add_op(g_dec, &d_op2, cpu_dev, nullptr), "d_op2");
+
+    /* Prefill has extra scratch storages (shifting raw storage IDs!) and runs on `mock_dev`. */
+    velri_storage_id p_pad = add_f32_storage(g_pre, VELRI_STORAGE_SCRATCH, n * 2U, mock_dev);
+    (void)p_pad;
+    velri_storage_id p_x = add_f32_storage(g_pre, VELRI_STORAGE_INPUT, n, mock_dev);
+    velri_storage_id p_w = add_f32_storage(g_pre, VELRI_STORAGE_WEIGHT, n, mock_dev);
+    velri_storage_id p_s = add_f32_storage(g_pre, VELRI_STORAGE_STATE, n, mock_dev);
+    velri_storage_id p_tmp = add_f32_storage(g_pre, VELRI_STORAGE_SCRATCH, n, mock_dev);
+    velri_storage_id p_y = add_f32_storage(g_pre, VELRI_STORAGE_OUTPUT, n, mock_dev);
+    velri_view_id vp_x = add_1d_view(g_pre, p_x, n);
+    velri_view_id vp_w = add_1d_view(g_pre, p_w, n);
+    velri_view_id vp_s = add_1d_view(g_pre, p_s, n);
+    velri_view_id vp_tmp = add_1d_view(g_pre, p_tmp, n);
+    velri_view_id vp_y = add_1d_view(g_pre, p_y, n);
+    /* Prefill: tmp = 2*x + w; s = s + tmp; y = s */
+    velri_op_desc p_op0 = {
+        .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 2U, .num_outputs = 1U,
+        .inputs = {vp_x, vp_w}, .outputs = {vp_tmp}, .attr.axpby = {.alpha = 2.0f, .beta = 1.0f},
+    };
+    velri_op_desc p_op1 = {
+        .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 2U, .num_outputs = 1U,
+        .inputs = {vp_s, vp_tmp}, .outputs = {vp_s}, .attr.axpby = {.alpha = 1.0f, .beta = 1.0f},
+    };
+    velri_op_desc p_op2 = {
+        .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 1U, .num_outputs = 1U,
+        .inputs = {vp_s}, .outputs = {vp_y}, .attr.axpby = {.alpha = 1.0f, .beta = 0.0f},
+    };
+    CHECK_OK(velri_graph_add_op(g_pre, &p_op0, mock_dev, nullptr), "p_op0");
+    CHECK_OK(velri_graph_add_op(g_pre, &p_op1, mock_dev, nullptr), "p_op1");
+    CHECK_OK(velri_graph_add_op(g_pre, &p_op2, mock_dev, nullptr), "p_op2");
+
+    /* Mismatched graph (different weight size) must fail `share_weights_from`. */
+    velri_storage_id b_w = add_f32_storage(g_bad, VELRI_STORAGE_WEIGHT, n * 2U, mock_dev);
+    velri_storage_id b_y = add_f32_storage(g_bad, VELRI_STORAGE_OUTPUT, n * 2U, mock_dev);
+    velri_op_desc b_op = {
+        .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 1U, .num_outputs = 1U,
+        .inputs = {add_1d_view(g_bad, b_w, n * 2U)}, .outputs = {add_1d_view(g_bad, b_y, n * 2U)},
+        .attr.axpby = {.alpha = 1.0f, .beta = 0.0f},
+    };
+    CHECK_OK(velri_graph_add_op(g_bad, &b_op, mock_dev, nullptr), "b_op");
+
+    velri_mock_async_reset_ctrl();
+    velri_plan *dec_plan = nullptr, *pre_plan = nullptr, *bad_plan = nullptr;
+    CHECK_OK(velri_plan_prepare(ctx, g_dec, nullptr, &dec_plan), "prep dec");
+    uint64_t allocs_after_dec_plan = atomic_load(&velri_mock_async_control()->total_allocs);
+
+    velri_plan_options share_opts = {.allow_cpu_fallback = false, .share_weights_from = dec_plan};
+    CHECK_OK(velri_plan_prepare(ctx, g_pre, &share_opts, &pre_plan), "prep pre shared weights");
+    uint64_t allocs_after_pre_plan = atomic_load(&velri_mock_async_control()->total_allocs);
+    CHECK(allocs_after_pre_plan == allocs_after_dec_plan,
+          "shared-weight prefill plan performs 0 duplicate weight slab allocs");
+
+    CHECK(velri_plan_prepare(ctx, g_bad, &share_opts, &bad_plan) == VELRI_ERR_INVALID,
+          "mismatched weight layout rejected");
+
+    velri_memory_report dec_rep, pre_rep;
+    CHECK_OK(velri_plan_memory_report(dec_plan, &dec_rep), "dec rep");
+    CHECK_OK(velri_plan_memory_report(pre_plan, &pre_rep), "pre rep");
+    CHECK(dec_rep.devices[mock_dev].weight_bytes == n * sizeof(float), "dec owns weights");
+    CHECK(pre_rep.devices[mock_dev].weight_bytes == 0U, "pre reports 0 duplicate weight bytes");
+
+    /* Bind weights ONCE on `dec_plan` -> visible in `pre_plan` immediately! */
+    float hw[32], hx[32], hy_pre[32] = {0}, hy_dec[32] = {0};
+    for (size_t i = 0; i < n; ++i) {
+        hw[i] = 2.0f + (float)i * 0.25f;
+        hx[i] = 1.0f + (float)i * 0.5f;
+    }
+    CHECK_OK(velri_plan_bind_weight_host(dec_plan, d_w, hw, sizeof(hw)), "bind weight once");
+
+    velri_slot *dec_slot = nullptr, *pre_slot = nullptr;
+    CHECK_OK(velri_slot_create(dec_plan, &dec_slot), "dec_slot");
+    uint64_t allocs_after_dec_slot = atomic_load(&velri_mock_async_control()->total_allocs);
+    CHECK_OK(velri_slot_create_shared_state(pre_plan, dec_slot, &pre_slot), "pre_slot shared state");
+    uint64_t allocs_after_pre_slot = atomic_load(&velri_mock_async_control()->total_allocs);
+    /* pre_slot allocates ONLY scratch + IO on mock_dev (2 arenas), NOT STATE (would be 3)! */
+    CHECK(allocs_after_pre_slot - allocs_after_dec_slot == 2U,
+          "shared-state prefill slot skips STATE allocation");
+
+    /* Mismatched state layout (bad_plan without STATE) must fail shared-state slot creation. */
+    CHECK_OK(velri_plan_prepare(ctx, g_bad, nullptr, &bad_plan), "prep bad standalone");
+    velri_slot *bad_slot = nullptr;
+    CHECK(velri_slot_create_shared_state(bad_plan, dec_slot, &bad_slot) == VELRI_ERR_INVALID,
+          "mismatched STATE layout rejected");
+    velri_plan_destroy(bad_plan);
+
+    CHECK_OK(velri_slot_bind_host(pre_slot, p_x, hx, sizeof(hx)), "bind pre x");
+    CHECK_OK(velri_slot_bind_host(pre_slot, p_y, hy_pre, sizeof(hy_pre)), "bind pre y");
+    CHECK_OK(velri_slot_bind_host(dec_slot, d_x, hx, sizeof(hx)), "bind dec x");
+    CHECK_OK(velri_slot_bind_host(dec_slot, d_y, hy_dec, sizeof(hy_dec)), "bind dec y");
+
+    /* Run prefill -> mutates shared STATE: s = 2*x + w */
+    CHECK_OK(velri_slot_run(pre_slot, nullptr, nullptr), "run pre_slot");
+    CHECK(velri_slot_last_run_allocs(pre_slot) == 0U, "pre_slot 0 hot-path allocs");
+    for (size_t i = 0; i < n; ++i) {
+        float exp_pre = 2.0f * hx[i] + hw[i];
+        CHECK(fabsf(hy_pre[i] - exp_pre) < 1e-5f, "pre_slot output exact");
+    }
+
+    /* Run decode -> reads shared STATE populated by prefill and adds x*w: s = (2*x + w) + x*w */
+    CHECK_OK(velri_slot_run(dec_slot, nullptr, nullptr), "run dec_slot");
+    CHECK(velri_slot_last_run_allocs(dec_slot) == 0U, "dec_slot 0 hot-path allocs");
+    for (size_t i = 0; i < n; ++i) {
+        float exp_dec = (2.0f * hx[i] + hw[i]) + hx[i] * hw[i];
+        CHECK(fabsf(hy_dec[i] - exp_dec) < 1e-5f, "dec_slot saw shared STATE from pre_slot");
+    }
+
+    /* Arbitrary destruction order (owner destroyed BEFORE borrower!): refcounts keep memory live! */
+    velri_slot_destroy(dec_slot);
+    velri_plan_destroy(dec_plan);
+    CHECK_OK(velri_slot_run(pre_slot, nullptr, nullptr), "pre_slot runs after owner destroyed");
+    for (size_t i = 0; i < n; ++i) {
+        float exp_after = 2.0f * (2.0f * hx[i] + hw[i]) + hx[i] * hw[i];
+        CHECK(fabsf(hy_pre[i] - exp_after) < 1e-5f, "shared STATE & WEIGHT intact after owner drop");
+    }
+
+    /* Chained sharing (A -> B -> C), borrower bind_weight_host, shared-state needs_reset
+     * propagation, dual host-bound STATE no-clobber, and alignment mismatch rejection. */
+    {
+        velri_plan *pA = nullptr, *pB = nullptr, *pC = nullptr;
+        CHECK_OK(velri_plan_prepare(ctx, g_dec, nullptr, &pA), "chain pA");
+        velri_plan_options optB = {.share_weights_from = pA};
+        CHECK_OK(velri_plan_prepare(ctx, g_pre, &optB, &pB), "chain pB");
+        velri_plan_options optC = {.share_weights_from = pB};
+        CHECK_OK(velri_plan_prepare(ctx, g_pre, &optC, &pC), "chain pC");
+
+        /* Bind weight directly via borrower `pC` -> forwards cleanly to root owner `pA`! */
+        CHECK_OK(velri_plan_bind_weight_host(pC, p_w, hw, sizeof(hw)), "bind via borrower pC");
+
+        velri_slot *sA = nullptr, *sB = nullptr, *sC = nullptr;
+        CHECK_OK(velri_slot_create(pA, &sA), "chain sA");
+        CHECK_OK(velri_slot_create_shared_state(pB, sA, &sB), "chain sB");
+        CHECK_OK(velri_slot_create_shared_state(pC, sB, &sC), "chain sC");
+
+        float stale_state[32];
+        for (size_t i = 0; i < n; ++i) stale_state[i] = 999.0f;
+        CHECK_OK(velri_slot_bind_host(sB, p_x, hx, sizeof(hx)), "sB x");
+        CHECK_OK(velri_slot_bind_host(sB, p_y, hy_pre, sizeof(hy_pre)), "sB y");
+        CHECK_OK(velri_slot_bind_host(sC, p_x, hx, sizeof(hx)), "sC x");
+        CHECK_OK(velri_slot_bind_host(sC, p_y, hy_dec, sizeof(hy_dec)), "sC y");
+        CHECK_OK(velri_slot_bind_host(sA, d_x, hx, sizeof(hx)), "sA x");
+        CHECK_OK(velri_slot_bind_host(sA, d_y, hy_dec, sizeof(hy_dec)), "sA y");
+
+        /* Run sB (populates shared STATE), then bind stale host buffer on sC & run sC:
+         * sC MUST NOT clobber live shared STATE with `stale_state`! */
+        CHECK_OK(velri_slot_run(sB, nullptr, nullptr), "sB run");
+        CHECK_OK(velri_slot_bind_host(sC, p_s, stale_state, sizeof(stale_state)), "sC bind stale");
+        CHECK_OK(velri_slot_run(sC, nullptr, nullptr), "sC run no-clobber");
+        for (size_t i = 0; i < n; ++i) {
+            float exp2 = 2.0f * (2.0f * hx[i] + hw[i]);
+            CHECK(fabsf(hy_dec[i] - exp2) < 1e-5f, "shared STATE not clobbered by peer bind");
+        }
+
+        /* Post-accept failure on sB propagates `needs_reset` to sA and sC via state_group! */
+        velri_mock_async_reset_ctrl();
+        atomic_store(&velri_mock_async_control()->fail_post_accept, true);
+        CHECK(velri_slot_run(sB, nullptr, nullptr) == VELRI_ERR_EXEC, "sB post-accept fail");
+        CHECK(velri_slot_needs_reset(sB) && velri_slot_needs_reset(sA) && velri_slot_needs_reset(sC),
+              "shared state_group propagates needs_reset to all peers");
+        CHECK(velri_slot_run(sA, nullptr, nullptr) == VELRI_ERR_BUSY, "peer sA refuses run");
+
+        /* Reset sA (zeroes STATE once) + reset sB & sC (skip redundant STATE zeroing). */
+        velri_mock_async_reset_ctrl();
+        CHECK_OK(velri_slot_reset(sA), "reset sA");
+        CHECK_OK(velri_slot_reset(sB), "reset sB");
+        CHECK_OK(velri_slot_reset(sC), "reset sC");
+        CHECK(!velri_slot_needs_reset(sA) && !velri_slot_needs_reset(sB) && !velri_slot_needs_reset(sC),
+              "all peers clean after reset");
+
+        velri_slot_destroy(sA);
+        velri_slot_destroy(sB);
+        velri_slot_destroy(sC);
+        velri_plan_destroy(pA);
+        velri_plan_destroy(pB);
+        velri_plan_destroy(pC);
+    }
+
+    /* Alignment mismatch rejection (owner align=64, borrower align=256) + host-memory weight sharing. */
+    {
+        velri_graph *g_hi = nullptr, *g_cpu1 = nullptr, *g_cpu2 = nullptr;
+        CHECK_OK(velri_graph_create(&g_hi), "g_hi");
+        velri_storage_desc sw_hi = {.kind = VELRI_STORAGE_WEIGHT, .dtype = VELRI_DTYPE_F32,
+                                    .byte_size = n * sizeof(float), .align = 256U, .device_id = mock_dev};
+        velri_storage_desc ss_hi = {.kind = VELRI_STORAGE_STATE, .dtype = VELRI_DTYPE_F32,
+                                    .byte_size = n * sizeof(float), .align = 256U, .device_id = mock_dev};
+        velri_storage_id hi_w = 0U, hi_s = 0U;
+        CHECK_OK(velri_graph_add_storage(g_hi, &sw_hi, &hi_w), "hi_w");
+        CHECK_OK(velri_graph_add_storage(g_hi, &ss_hi, &hi_s), "hi_s");
+        velri_storage_id hi_y = add_f32_storage(g_hi, VELRI_STORAGE_OUTPUT, n, mock_dev);
+        velri_op_desc hi_op = {
+            .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 2U, .num_outputs = 1U,
+            .inputs = {add_1d_view(g_hi, hi_w, n), add_1d_view(g_hi, hi_s, n)},
+            .outputs = {add_1d_view(g_hi, hi_y, n)},
+            .attr.axpby = {.alpha = 1.0f, .beta = 1.0f},
+        };
+        CHECK_OK(velri_graph_add_op(g_hi, &hi_op, mock_dev, nullptr), "hi_op");
+
+        velri_plan *p_lo = nullptr, *p_hi = nullptr;
+        CHECK_OK(velri_plan_prepare(ctx, g_dec, nullptr, &p_lo), "p_lo");
+        velri_plan_options hi_w_opts = {.share_weights_from = p_lo};
+        CHECK(velri_plan_prepare(ctx, g_hi, &hi_w_opts, &p_hi) == VELRI_ERR_INVALID,
+              "under-aligned owner weight slab rejected");
+        CHECK_OK(velri_plan_prepare(ctx, g_hi, nullptr, &p_hi), "p_hi standalone");
+        velri_slot *s_lo = nullptr, *s_hi = nullptr;
+        CHECK_OK(velri_slot_create(p_lo, &s_lo), "s_lo");
+        CHECK(velri_slot_create_shared_state(p_hi, s_lo, &s_hi) == VELRI_ERR_INVALID,
+              "under-aligned owner STATE arena rejected");
+        velri_slot_destroy(s_lo);
+        velri_plan_destroy(p_hi);
+        velri_plan_destroy(p_lo);
+        velri_graph_destroy(g_hi);
+
+        /* Host-memory (`cpu:0`) shared weights across 2 plans. */
+        CHECK_OK(velri_graph_create(&g_cpu1), "g_cpu1");
+        CHECK_OK(velri_graph_create(&g_cpu2), "g_cpu2");
+        velri_storage_id c1_w = add_f32_storage(g_cpu1, VELRI_STORAGE_WEIGHT, n, cpu_dev);
+        velri_storage_id c1_y = add_f32_storage(g_cpu1, VELRI_STORAGE_OUTPUT, n, cpu_dev);
+        velri_op_desc c1_op = {
+            .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 1U, .num_outputs = 1U,
+            .inputs = {add_1d_view(g_cpu1, c1_w, n)}, .outputs = {add_1d_view(g_cpu1, c1_y, n)},
+            .attr.axpby = {.alpha = 3.0f, .beta = 0.0f},
+        };
+        CHECK_OK(velri_graph_add_op(g_cpu1, &c1_op, cpu_dev, nullptr), "c1_op");
+
+        velri_storage_id c2_pad = add_f32_storage(g_cpu2, VELRI_STORAGE_SCRATCH, n, cpu_dev);
+        (void)c2_pad;
+        velri_storage_id c2_w = add_f32_storage(g_cpu2, VELRI_STORAGE_WEIGHT, n, cpu_dev);
+        velri_storage_id c2_y = add_f32_storage(g_cpu2, VELRI_STORAGE_OUTPUT, n, cpu_dev);
+        velri_op_desc c2_op = {
+            .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 1U, .num_outputs = 1U,
+            .inputs = {add_1d_view(g_cpu2, c2_w, n)}, .outputs = {add_1d_view(g_cpu2, c2_y, n)},
+            .attr.axpby = {.alpha = 4.0f, .beta = 0.0f},
+        };
+        CHECK_OK(velri_graph_add_op(g_cpu2, &c2_op, cpu_dev, nullptr), "c2_op");
+
+        velri_plan *pc1 = nullptr, *pc2 = nullptr;
+        CHECK_OK(velri_plan_prepare(ctx, g_cpu1, nullptr, &pc1), "pc1");
+        velri_plan_options copt = {.share_weights_from = pc1};
+        CHECK_OK(velri_plan_prepare(ctx, g_cpu2, &copt, &pc2), "pc2 shared host weight");
+        CHECK_OK(velri_plan_bind_weight_host(pc1, c1_w, hw, sizeof(hw)), "bind host weight once");
+
+        velri_slot *sc2 = nullptr;
+        CHECK_OK(velri_slot_create(pc2, &sc2), "sc2");
+        float hc_out[32] = {0};
+        CHECK_OK(velri_slot_bind_host(sc2, c2_y, hc_out, sizeof(hc_out)), "sc2 y");
+        CHECK_OK(velri_slot_run(sc2, nullptr, nullptr), "sc2 run");
+        for (size_t i = 0; i < n; ++i) {
+            CHECK(fabsf(hc_out[i] - 4.0f * hw[i]) < 1e-5f, "shared host weight exact");
+        }
+        velri_slot_destroy(sc2);
+        velri_plan_destroy(pc2);
+        velri_plan_destroy(pc1);
+        velri_graph_destroy(g_cpu2);
+        velri_graph_destroy(g_cpu1);
+    }
+
+    velri_slot_destroy(pre_slot);
+    velri_plan_destroy(pre_plan);
+    velri_graph_destroy(g_dec);
+    velri_graph_destroy(g_pre);
+    velri_graph_destroy(g_bad);
+    printf("  [PASS] Dual-plan shared WEIGHT slabs & shared STATE arenas (0 duplication, refcounted, state_group).\n");
+}
+
 int main(void) {
     printf("=== Velri-lib Core & Backend Contract Suite ===\n");
     velri_context_config cfg = {
@@ -794,6 +1096,7 @@ int main(void) {
     test_shared_weights_and_resident_state(ctx, mock_dev);
     test_refcounted_lifetimes_and_graph_growth();
     test_errors_and_cancellation(ctx, cpu_dev, mock_dev);
+    test_shared_weights_and_shared_state_dual_plan(ctx, cpu_dev, mock_dev);
 #ifdef VELRI_CORE_HAS_VULKAN
     test_hybrid_cpu_vulkan(ctx, cpu_dev);
 #endif

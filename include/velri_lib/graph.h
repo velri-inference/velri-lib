@@ -54,6 +54,7 @@ typedef struct {
     size_t scratch_unpacked_bytes; /* Sum of declared scratch storages on this device */
     size_t scratch_packed_bytes;   /* Actual liveness-packed scratch arena per slot */
     size_t allocator_overhead_bytes;
+    size_t state_overhead_bytes;   /* STATE arena alignment subset of `allocator_overhead_bytes` */
 } velri_device_memory_report;
 
 typedef struct {
@@ -65,7 +66,10 @@ typedef struct {
 } velri_memory_report;
 
 typedef struct {
-    bool allow_cpu_fallback; /* Default false: unsupported op on chosen device returns UNSUPPORTED */
+    bool allow_cpu_fallback;        /* Default false: unsupported op on chosen device returns UNSUPPORTED */
+    velri_plan *share_weights_from; /* Optional: share immutable WEIGHT slabs & host bindings from
+                                     * an existing plan on the same context (0 duplicate weight memory
+                                     * across dual prefill/decode plans with matching weight layout). */
 } velri_plan_options;
 
 velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
@@ -78,10 +82,18 @@ velri_status velri_plan_bind_weight_host(velri_plan *plan, velri_storage_id stor
 
 velri_status velri_plan_memory_report(const velri_plan *plan, velri_memory_report *out_report);
 uint32_t velri_plan_launch_step_count(const velri_plan *plan);
+velri_status velri_plan_barrier_stats(const velri_plan *plan, uint32_t *out_total_ops,
+                                      uint32_t *out_elided_barriers);
 
 /* ---- Execution Slots (Independent, Reusable, 0 B Hot-Path Allocation) ---- */
 
 velri_status velri_slot_create(velri_plan *plan, velri_slot **out_slot);
+
+/* Create an execution slot sharing persistent `VELRI_STORAGE_STATE` arenas with `state_owner`
+ * (0 duplicate state memory across dual prefill/decode slots on matching per-device STATE layouts).
+ * Slots sharing STATE must not execute concurrently; destruction order is arbitrary (refcounted). */
+velri_status velri_slot_create_shared_state(velri_plan *plan, velri_slot *state_owner,
+                                            velri_slot **out_slot);
 void velri_slot_destroy(velri_slot *slot);
 
 /* Bind host buffer to per-slot INPUT, OUTPUT, or STATE storage (use plan API for WEIGHT). */
@@ -101,5 +113,8 @@ velri_status velri_slot_reset(velri_slot *slot);
 
 /* Real count of backend device allocations performed during the last `velri_slot_run`. */
 uint64_t velri_slot_last_run_allocs(const velri_slot *slot);
+
+/* Count of persistent captured launch-graph replays executed during the last `velri_slot_run`. */
+uint64_t velri_slot_last_run_graph_replays(const velri_slot *slot);
 
 #endif /* VELRI_LIB_GRAPH_H */

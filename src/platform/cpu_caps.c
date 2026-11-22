@@ -10,41 +10,6 @@
 #endif
 #endif
 
-size_t velri_dtype_bytes(velri_dtype dtype) {
-    switch (dtype) {
-    case VELRI_DTYPE_F32:
-    case VELRI_DTYPE_I32:
-        return 4;
-    case VELRI_DTYPE_F64:
-        return 8;
-    case VELRI_DTYPE_F16:
-    case VELRI_DTYPE_BF16:
-        return 2;
-    case VELRI_DTYPE_I8:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-size_t velri_dtype_align(velri_dtype dtype) {
-    switch (dtype) {
-    case VELRI_DTYPE_F32:
-        return alignof(float);
-    case VELRI_DTYPE_F64:
-        return alignof(double);
-    case VELRI_DTYPE_F16:
-    case VELRI_DTYPE_BF16:
-        return alignof(uint16_t);
-    case VELRI_DTYPE_I8:
-        return alignof(int8_t);
-    case VELRI_DTYPE_I32:
-        return alignof(int32_t);
-    default:
-        return 1;
-    }
-}
-
 #if defined(__x86_64__) || defined(_M_X64)
 static uint64_t read_xcr0(void) {
 #if defined(_MSC_VER)

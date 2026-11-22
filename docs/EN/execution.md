@@ -4,7 +4,7 @@
 
 This document defines the execution model of `Velri-lib`: what runs during preparation, how CPU and Vulkan cooperate, how memory visibility is synchronized, and how errors and cancellation behave. For overall library boundaries see [architecture.md](architecture.md); for kernels see [kernels.md](kernels.md).
 
-**Status:** the core execution model (`velri_plan_prepare`, scratch arena packing, RAM transfer bus, independent `velri_slot` execution, completion draining, and cancellation) is implemented and verified by `core_contract` across CPU, `mock_async`, and optional Vulkan ([architecture.md](architecture.md)); advanced Vulkan async sync (timeline semaphores / command reuse) and disk staging (PLE) follow in later stages.
+**Status:** the core execution model (`velri_plan_prepare`, scratch arena packing, post-packing DAG barrier elision, RAM transfer bus, cross-plan shared WEIGHT slabs via `share_weights_from`, cross-slot shared STATE arenas via `velri_slot_create_shared_state`, persistent Vulkan decode command capture/replay with bucketed FlashDecoding Split-KV, completion draining, and cancellation) is implemented and verified across CPU, `mock_async`, and optional Vulkan ([architecture.md](architecture.md)); timeline semaphores, `synchronization2`, and disk staging (PLE) follow in later stages.
 
 ---
 
@@ -19,6 +19,8 @@ Everything invariant stays out of the token-generation loop:
 | Choose placement, AOT kernels, layouts, and explicit transfers/conversions | Submit prepared work to backends (`submit`) |
 | Compute full memory budget and reserve buffers/slots | Wait for completion (`wait`) and return outputs |
 | Pack immutable weights once and build GPU pipelines / descriptors | `0 B` heap allocations, no JSON parsing or string lookup |
+
+The plan records the length of each same-device submission and its capture index. A transfer ends the batch. Slot creation and execution use the recorded boundaries, including single-operation submissions for backends without batch support.
 
 If raw weights are no longer needed after packing, their buffer is released explicitly. Whenever both representations are alive simultaneously, both count toward the memory budget.
 

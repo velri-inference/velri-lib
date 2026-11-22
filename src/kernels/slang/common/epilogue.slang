@@ -1,6 +1,10 @@
 // Shared output epilogue components for Linear (GEMV & GEMM) across CPU and Vulkan.
 module epilogue;
 
+public static const uint kEpFlagBias = 1u;
+public static const uint kEpFlagXScale = 2u;
+public static const uint kEpFlagWScale = 4u;
+
 public struct EpilogueParams {
     public Ptr<float, Access.Read> bias;
     public Ptr<float, Access.Read> x_scale;
@@ -9,6 +13,22 @@ public struct EpilogueParams {
     public uint has_x_scale;
     public uint has_w_scale;
 };
+
+public EpilogueParams make_epilogue_params(
+    Ptr<float, Access.Read> bias,
+    Ptr<float, Access.Read> x_scale,
+    Ptr<float, Access.Read> w_scale,
+    uint flags)
+{
+    EpilogueParams ep;
+    ep.bias = bias;
+    ep.x_scale = x_scale;
+    ep.w_scale = w_scale;
+    ep.has_bias = flags & kEpFlagBias;
+    ep.has_x_scale = flags & kEpFlagXScale;
+    ep.has_w_scale = flags & kEpFlagWScale;
+    return ep;
+}
 
 public interface IEpilogue {
     static float apply(float acc, uint row, uint col, EpilogueParams ep);

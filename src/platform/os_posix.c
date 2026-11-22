@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #ifndef _XOPEN_SOURCE
 #define _XOPEN_SOURCE 700
 #endif
@@ -8,6 +11,12 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
+#if defined(__linux__)
+#include <sched.h>
+#include <stdio.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #if __has_include(<unistd.h>)
 #include <unistd.h>
@@ -20,14 +29,10 @@ static const size_t kMinWorkerStackBytes = 512U * 1024U;
 /* ---- Aligned Memory ---- */
 
 void *velri_os_aligned_alloc(size_t align, size_t bytes) {
-    size_t eff_align = align < sizeof(void *) ? sizeof(void *) : align;
-    if ((eff_align & (eff_align - 1U)) != 0U) {
+    size_t eff_align = 0U, sz = 0U;
+    if (!velri_os_aligned_size(align, bytes, &eff_align, &sz)) {
         return nullptr;
     }
-    if (bytes > SIZE_MAX - (eff_align - 1U)) {
-        return nullptr;
-    }
-    size_t sz = bytes ? ((bytes + eff_align - 1U) & ~(eff_align - 1U)) : eff_align;
     void *p = nullptr;
     if (posix_memalign(&p, eff_align, sz) != 0) {
         return nullptr;
@@ -58,18 +63,10 @@ void velri_os_sleep_ms(uint32_t ms) {
 
 /* ---- Dynamic Shared Library Loading ---- */
 
-velri_os_lib *velri_os_dlopen_vulkan(void) {
-    static const char *const candidates[] = {
-#if defined(__APPLE__)
-        "libvulkan.1.dylib",
-        "libvulkan.dylib",
-        "libMoltenVK.dylib",
-#else
-        "libvulkan.so.1",
-        "libvulkan.so",
-#endif
-        nullptr,
-    };
+velri_os_lib *velri_os_dlopen(const char *const *candidates) {
+    if (!candidates) {
+        return nullptr;
+    }
     for (size_t i = 0U; candidates[i] != nullptr; ++i) {
         void *h = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
         if (h) {
@@ -214,6 +211,8 @@ void velri_os_cond_wait(velri_os_cond *cv, velri_os_mutex *mtx) {
 
 void velri_os_cond_signal(velri_os_cond *cv) { pthread_cond_signal(&cv->handle); }
 
+void velri_os_cond_broadcast(velri_os_cond *cv) { pthread_cond_broadcast(&cv->handle); }
+
 /* ---- CPU Hints ---- */
 
 int velri_os_hardware_threads(void) {
@@ -224,6 +223,74 @@ int velri_os_hardware_threads(void) {
     }
 #endif
     return 1;
+}
+
+#if defined(__linux__)
+/* Siblings belonging to the same physical core have the same kernel-provided CPU list.
+ * Count the first allowed sibling even if the process cannot run on the lowest sibling. */
+static bool first_allowed_sibling(int cpu, const cpu_set_t *allowed, bool *out_first) {
+    char path[96];
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        return false;
+    }
+    bool found = false;
+    bool earlier = false;
+    int separator;
+    do {
+        unsigned first, last;
+        if (fscanf(file, "%u", &first) != 1) {
+            break;
+        }
+        last = first;
+        separator = fgetc(file);
+        if (separator == '-') {
+            if (fscanf(file, "%u", &last) != 1 || last < first) {
+                break;
+            }
+            separator = fgetc(file);
+        }
+        if (first <= (unsigned)cpu && (unsigned)cpu <= last) {
+            found = true;
+        }
+        for (unsigned i = first; i <= last && i < (unsigned)cpu; ++i) {
+            if (CPU_ISSET(i, allowed)) {
+                earlier = true;
+                break;
+            }
+        }
+    } while (separator == ',');
+    fclose(file);
+    *out_first = !earlier;
+    return found;
+}
+#endif
+
+uint32_t velri_os_available_physical_cores(void) {
+#if defined(__linux__)
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return 0U;
+    }
+    uint32_t count = 0U;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed)) {
+            bool first;
+            if (!first_allowed_sibling(cpu, &allowed, &first)) {
+                return 0U;
+            }
+            count += first;
+        }
+    }
+    return count;
+#elif defined(__APPLE__)
+    uint32_t cores = 0U;
+    size_t size = sizeof(cores);
+    return sysctlbyname("hw.physicalcpu", &cores, &size, nullptr, 0U) == 0 ? cores : 0U;
+#else
+    return 0U;
+#endif
 }
 
 void velri_os_cpu_relax(void) {

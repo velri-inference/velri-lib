@@ -10,14 +10,14 @@
 
 ## 1. Boundary Between Velri-lib and Velri
 
-Adding a new model block built from supported operations requires no changes to `Velri-lib`. Adding a new backend for supported operations requires no changes to `Velri`.
+Adding a new model architecture or engine layer descriptor built from supported blocks and operations requires no changes to `Velri-lib`. Adding a new backend for supported operations requires no changes to `Velri`.
 
 | Velri-lib | Velri (Engine) |
 | :--- | :--- |
-| Tensor views, storage descriptors, layouts, and numeric formats | Model configuration, weight-name mapping, and family adapters |
-| Unified kernel suite (**Slang AOT**) and independent C23 references | Reusable blocks (`MLP`, `Attention`, `MoE`, `GDN`), layers, and architectures |
-| Graph builder, validation, kernel selection, and launch plans | Model graph assembly via the library's C API |
-| Memory planning, weight packing, RAM transfers, and dependencies | Placement policies, resource budgets, and workload limits |
+| Tensor views, storage descriptors, layouts, and numeric formats | Model metadata (`velri_model_params`), config parsing, weight-name mapping, and family adapters |
+| Unified kernel suite (**Slang AOT**) and independent C23 references | Placement JSON scopes (`input-layer`, `hidden-layers`, `attention`, `kv-cache`, `dense-mlp`, `lm-head`), metadata-driven layer helpers (`src/model/layers.{h,c}`), and model architectures (`src/model/arch/`) |
+| Operation graph, `velri_builder` + `velri_manifest`, and config-agnostic reusable blocks (`norm`, `linear`, `embedding`, `attention_core`/`dense`/`latent`, `mlp`, `lm_head`, generic `pre_norm`) | Model graph assembly via the library's C API |
+| Validation, kernel selection, memory planning, weight packing, RAM transfers, and launch plans | Placement policies, resource budgets, and workload limits |
 | Backend registry, devices, `velri_pool`, GPU queues, and completion | `Model`, `Program`, `Session`, request batching, generation, and sampling |
 | Mathematical decoding of quantized weight formats | Model file/container I/O, metadata, tokenization, and CLI/HTTP |
 | Operation references, contract tests, and kernel benchmarks | Full-model fixtures, logit verification, and end-to-end benchmarks |
@@ -113,13 +113,14 @@ Input storage, weight storage, accumulator, and output dtypes are specified inde
 
 | Directory | Status | Purpose |
 | :--- | :--- | :--- |
-| `include/velri_lib/` | Implemented (`types.h`, `backend.h`, `graph.h`, `velri_lib.h`) | Public C23 library API |
+| `include/velri_lib/` | Implemented (`types.h`, `backend.h`, `graph.h`, `blocks.h`, `velri_lib.h`) | Public C23 library API |
 | `src/backend/cpu/` | Implemented (`cpu_backend.c`) | Built-in Slang AOT CPU backend over internal `velri_pool` |
 | `src/platform/` | Implemented (`os.h`, `os_posix.c`, `os_win32.c`, `cpu_caps.c`, `pool.{h,c}`) | OS abstraction boundary, CPU ISA detection, persistent `velri_pool` |
 | `src/kernels/slang/` | Implemented (`common/`, `ops/`, `entry_cpu.slang`, `vk/*.slang`) | Modular Slang kernel sources (AOT → CPU LLVM IR / `.o` and Vulkan SPIR-V 1.6) |
-| `src/core/`, `src/ops/`, `src/graph/` | Implemented (`tensor.c`, `runtime_ctx.c`, `registry.c`, `graph.c`) | Tensors, storage, op validator, static backend registry, and graph builder |
+| `src/core/`, `src/ops/`, `src/graph/` | Implemented (`tensor.c`, `runtime_ctx.c`, `registry.c`, `graph.c`) | Tensors, storage, op validator, static backend registry, and graph IR |
+| `src/blocks/`, `src/layers/` | Implemented (`builder.c`, `norm.c`, `embedding.c`, `attention.c`, `mlp.c`, `lm_head.c`, `pre_norm.c`) | Graph builder, named manifest, and config-agnostic reusable blocks & generic pre-norm layer |
 | `src/plan/`, `src/runtime/` | Implemented (`planner.c`, `executor.c`) | Liveness scratch planner, RAM transfers, batched execution slots, cancellation |
-| `src/backend/vulkan/` | Implemented (opt-in `-DVELRI_ENABLE_VULKAN=ON`) | Built-in Vulkan 1.3 / SPIR-V 1.6 backend (`vk_backend.c`) with async `VkFence` ring |
+| `src/backend/vulkan/` | Implemented (opt-in `-DVELRI_ENABLE_VULKAN=ON`) | Built-in Vulkan 1.3 / SPIR-V 1.6 backend (`vk_internal.h`, `vk_{device,memory,pipeline,dispatch}.c`) with async `VkFence` ring |
 | `tests/`, `tools/`, `cmake/` | Implemented | References (`reference.c`), `test_kernels`, `test_core_contract` (+ `mock_async`), optional `bench_slang_cpu`/`bench_vulkan`, `slang.cmake` |
 
 Planned directories are not populated with stub APIs ahead of working code. Standalone and integrated build instructions live in [velri-lib/README.md](../../README.md) and [Velri Architecture](../../../docs/EN/architecture.md).

@@ -9,6 +9,14 @@
  * live in `os.h`).
  */
 
+enum {
+    VELRI_POOL_MASK_WORDS = VELRI_POOL_MAX_WORKERS / 64
+};
+
+static_assert(VELRI_POOL_MAX_WORKERS > 0 && (VELRI_POOL_MAX_WORKERS % 64) == 0 &&
+                  VELRI_POOL_MAX_WORKERS <= 65535,
+              "VELRI_POOL_MAX_WORKERS must be a positive multiple of 64 fitting in 16 bits");
+
 typedef struct {
     alignas(64) _Atomic uint64_t done_gen;
     size_t worker_id;
@@ -26,15 +34,40 @@ struct velri_pool {
     size_t last_nw;
     uint64_t host_gen;
     alignas(64) _Atomic uint64_t dispatch_word; /* (gen << 16) | (nw & 0xFFFFU) */
-    alignas(64) _Atomic uint64_t parked_mask[4];
+    alignas(64) _Atomic uint64_t parked_mask[VELRI_POOL_MASK_WORDS];
     velri_worker_slot *slots;
 };
+
+static inline uint64_t pack_dispatch_word(uint64_t gen, size_t nw) {
+    return (gen << 16) | ((uint64_t)nw & UINT64_C(0xFFFF));
+}
+
+static inline void unpack_dispatch_word(uint64_t word, uint64_t *out_gen, size_t *out_nw) {
+    *out_gen = word >> 16;
+    *out_nw = (size_t)(word & UINT64_C(0xFFFF));
+}
 
 static void signal_worker_slot(velri_worker_slot *slot) {
     if (slot->mtx && slot->cv) {
         velri_os_mutex_lock(slot->mtx);
         velri_os_cond_signal(slot->cv);
         velri_os_mutex_unlock(slot->mtx);
+    }
+}
+
+static void stop_and_join_workers(velri_pool *pool, size_t spawned_count) {
+    if (spawned_count <= 1U) {
+        return;
+    }
+    atomic_store_explicit(&pool->stopping, true, memory_order_seq_cst);
+    uint64_t next_gen = ++pool->host_gen;
+    atomic_store_explicit(&pool->dispatch_word, pack_dispatch_word(next_gen, pool->num_workers),
+                          memory_order_seq_cst);
+    for (size_t j = 1U; j < spawned_count; ++j) {
+        signal_worker_slot(&pool->slots[j]);
+    }
+    for (size_t j = 1U; j < spawned_count; ++j) {
+        velri_os_thread_join(pool->slots[j].thread);
     }
 }
 
@@ -50,8 +83,9 @@ static void worker_loop(void *arg) {
     uint64_t g = UINT64_C(1);
     for (;;) {
         uint64_t word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
-        uint64_t cg = word >> 16;
-        size_t cnw = (size_t)(word & UINT64_C(0xFFFF));
+        uint64_t cg = 0U;
+        size_t cnw = 0U;
+        unpack_dispatch_word(word, &cg, &cnw);
 
         if (cg == g && wid < cnw) {
             const uint64_t deadline = velri_os_monotonic_ns() + UINT64_C(250000000);
@@ -59,12 +93,11 @@ static void worker_loop(void *arg) {
                 for (int spin = 0; spin < 2048; ++spin) {
                     velri_os_cpu_relax();
                     word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
-                    cg = word >> 16;
+                    unpack_dispatch_word(word, &cg, &cnw);
                     if (cg != g) {
                         break;
                     }
                 }
-                cnw = (size_t)(word & UINT64_C(0xFFFF));
                 if (cg != g || wid >= cnw ||
                     atomic_load_explicit(&pool->stopping, memory_order_relaxed)) {
                     break;
@@ -78,8 +111,7 @@ static void worker_loop(void *arg) {
             atomic_fetch_or_explicit(&pool->parked_mask[mask_idx], mask_bit, memory_order_seq_cst);
             while (!atomic_load_explicit(&pool->stopping, memory_order_acquire)) {
                 word = atomic_load_explicit(&pool->dispatch_word, memory_order_seq_cst);
-                cg = word >> 16;
-                cnw = (size_t)(word & UINT64_C(0xFFFF));
+                unpack_dispatch_word(word, &cg, &cnw);
                 if (cg != g && wid < cnw) {
                     break;
                 }
@@ -103,7 +135,7 @@ static void worker_loop(void *arg) {
 }
 
 static void free_pool_slots(velri_pool *pool, size_t count) {
-    for (size_t j = 0; j < count; ++j) {
+    for (size_t j = 0U; j < count; ++j) {
         velri_os_cond_destroy(pool->slots[j].cv);
         velri_os_mutex_destroy(pool->slots[j].mtx);
     }
@@ -112,41 +144,41 @@ static void free_pool_slots(velri_pool *pool, size_t count) {
 }
 
 velri_status velri_pool_create(size_t num_workers, velri_pool **out_pool) {
-    if (!out_pool || num_workers == 0 || num_workers > 256) {
+    if (!out_pool || num_workers == 0U || num_workers > VELRI_POOL_MAX_WORKERS) {
         return VELRI_ERR_INVALID;
     }
     *out_pool = nullptr;
 
-    velri_pool *pool = (velri_pool *)velri_os_aligned_alloc(64, sizeof(velri_pool));
+    velri_pool *pool = (velri_pool *)velri_os_aligned_alloc(64U, sizeof(velri_pool));
     if (!pool) {
         return VELRI_ERR_NOMEM;
     }
     memset(pool, 0, sizeof(*pool));
     pool->num_workers = num_workers;
-    pool->last_nw = 1ULL;
+    pool->last_nw = 1U;
     pool->host_gen = UINT64_C(1);
     atomic_init(&pool->stopping, false);
-    atomic_init(&pool->dispatch_word, (UINT64_C(1) << 16) | UINT64_C(1));
-    for (size_t m = 0; m < 4; ++m) {
+    atomic_init(&pool->dispatch_word, pack_dispatch_word(UINT64_C(1), 1U));
+    for (size_t m = 0U; m < VELRI_POOL_MASK_WORDS; ++m) {
         atomic_init(&pool->parked_mask[m], UINT64_C(0));
     }
 
     pool->slots = (velri_worker_slot *)velri_os_aligned_alloc(
-        64, num_workers * sizeof(velri_worker_slot));
+        64U, num_workers * sizeof(velri_worker_slot));
     if (!pool->slots) {
         velri_os_aligned_free(pool);
         return VELRI_ERR_NOMEM;
     }
     memset(pool->slots, 0, num_workers * sizeof(velri_worker_slot));
 
-    for (size_t i = 0; i < num_workers; ++i) {
+    for (size_t i = 0U; i < num_workers; ++i) {
         pool->slots[i].worker_id = i;
         pool->slots[i].pool = pool;
         atomic_init(&pool->slots[i].done_gen, UINT64_C(0));
-        if (i > 0) {
+        if (i > 0U) {
             if (!velri_os_mutex_create(&pool->slots[i].mtx) ||
                 !velri_os_cond_create(&pool->slots[i].cv)) {
-                free_pool_slots(pool, i + 1);
+                free_pool_slots(pool, i + 1U);
                 return VELRI_ERR_NOMEM;
             }
         }
@@ -154,24 +186,15 @@ velri_status velri_pool_create(size_t num_workers, velri_pool **out_pool) {
 
     atomic_store_explicit(&pool->slots[0].done_gen, UINT64_C(1), memory_order_release);
 
-    for (size_t i = 1; i < num_workers; ++i) {
+    for (size_t i = 1U; i < num_workers; ++i) {
         if (!velri_os_thread_spawn(&pool->slots[i].thread, worker_loop, &pool->slots[i])) {
-            atomic_store_explicit(&pool->stopping, true, memory_order_seq_cst);
-            uint64_t next_gen = ++pool->host_gen;
-            atomic_store_explicit(&pool->dispatch_word, (next_gen << 16) | (uint64_t)num_workers,
-                                  memory_order_seq_cst);
-            for (size_t j = 1; j < i; ++j) {
-                signal_worker_slot(&pool->slots[j]);
-            }
-            for (size_t j = 1; j < i; ++j) {
-                velri_os_thread_join(pool->slots[j].thread);
-            }
+            stop_and_join_workers(pool, i);
             free_pool_slots(pool, num_workers);
             return VELRI_ERR_NOMEM;
         }
     }
 
-    for (size_t i = 1; i < num_workers; ++i) {
+    for (size_t i = 1U; i < num_workers; ++i) {
         while (atomic_load_explicit(&pool->slots[i].done_gen, memory_order_acquire) !=
                UINT64_C(1)) {
             velri_os_cpu_relax();
@@ -186,18 +209,7 @@ void velri_pool_destroy(velri_pool *pool) {
     if (!pool) {
         return;
     }
-    if (pool->num_workers > 1) {
-        atomic_store_explicit(&pool->stopping, true, memory_order_seq_cst);
-        uint64_t next_gen = ++pool->host_gen;
-        atomic_store_explicit(&pool->dispatch_word, (next_gen << 16) | (uint64_t)pool->num_workers,
-                              memory_order_seq_cst);
-        for (size_t i = 1; i < pool->num_workers; ++i) {
-            signal_worker_slot(&pool->slots[i]);
-        }
-        for (size_t i = 1; i < pool->num_workers; ++i) {
-            velri_os_thread_join(pool->slots[i].thread);
-        }
-    }
+    stop_and_join_workers(pool, pool->num_workers);
     free_pool_slots(pool, pool->num_workers);
 }
 
@@ -205,14 +217,14 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
     if (!fn) {
         return;
     }
-    if (!pool || active_workers <= 1 || pool->num_workers == 1) {
-        if (pool && pool->last_nw > 1) {
-            pool->last_nw = 1ULL;
+    if (!pool || active_workers <= 1U || pool->num_workers == 1U) {
+        if (pool && pool->last_nw > 1U) {
+            pool->last_nw = 1U;
             uint64_t next_gen = ++pool->host_gen;
-            atomic_store_explicit(&pool->dispatch_word, (next_gen << 16) | UINT64_C(1),
+            atomic_store_explicit(&pool->dispatch_word, pack_dispatch_word(next_gen, 1U),
                                   memory_order_release);
         }
-        fn(ctx, 0, 1);
+        fn(ctx, 0U, 1U);
         return;
     }
 
@@ -222,31 +234,32 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
     pool->fn_ctx = ctx;
 
     uint64_t next_gen = ++pool->host_gen;
-    atomic_store_explicit(&pool->dispatch_word, (next_gen << 16) | (uint64_t)nw,
+    atomic_store_explicit(&pool->dispatch_word, pack_dispatch_word(next_gen, nw),
                           memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);
 
-    size_t n_words = (nw + 63ULL) >> 6;
-    for (size_t m = 0; m < n_words; ++m) {
+    size_t n_words = (nw + 63U) >> 6;
+    for (size_t m = 0U; m < n_words; ++m) {
         uint64_t valid = ~UINT64_C(0);
-        if (m == 0) {
+        if (m == 0U) {
             valid &= ~UINT64_C(1); /* slot 0 is caller */
         }
-        if ((m + 1ULL) * 64ULL > nw) {
-            size_t rem = nw - m * 64ULL;
+        size_t base = m * 64U;
+        if (nw > base && nw - base < 64U) {
+            size_t rem = nw - base;
             valid &= (UINT64_C(1) << rem) - UINT64_C(1);
         }
         uint64_t pm = atomic_load_explicit(&pool->parked_mask[m], memory_order_relaxed) & valid;
-        while (pm != 0) {
+        while (pm != 0U) {
             size_t bit = velri_os_ctz64(pm);
             pm &= pm - UINT64_C(1);
-            signal_worker_slot(&pool->slots[m * 64ULL + bit]);
+            signal_worker_slot(&pool->slots[m * 64U + bit]);
         }
     }
 
-    fn(ctx, 0, nw);
+    fn(ctx, 0U, nw);
 
-    for (size_t i = 1; i < nw; ++i) {
+    for (size_t i = 1U; i < nw; ++i) {
         while (atomic_load_explicit(&pool->slots[i].done_gen, memory_order_acquire) != next_gen) {
             velri_os_cpu_relax();
         }

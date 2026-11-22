@@ -20,6 +20,11 @@ static bool validate_vtable(const velri_backend_vtable *vt) {
     if ((vt->wait != nullptr) != (vt->destroy_completion != nullptr)) {
         return false;
     }
+    bool has_cap = (vt->capture_graph != nullptr);
+    if ((vt->destroy_captured_graph != nullptr) != has_cap ||
+        (vt->replay_graph != nullptr) != has_cap) {
+        return false;
+    }
     return true;
 }
 
@@ -52,22 +57,15 @@ static velri_status register_backend_with_cfg(velri_context *ctx,
         velri_backend_device *dev = nullptr;
         st = vtable->open_device(idx, open_cfg, &dev);
         if (st != VELRI_OK || !dev) {
-            for (uint32_t j = start_dev; j < ctx->num_devices; ++j) {
-                ctx->devices[j].vt->close_device(ctx->devices[j].dev);
-            }
-            ctx->num_devices = start_dev;
-            return (st != VELRI_OK) ? st : VELRI_ERR_EXEC;
+            st = (st != VELRI_OK) ? st : VELRI_ERR_EXEC;
+            goto rollback;
         }
         velri_device_caps caps;
         memset(&caps, 0, sizeof(caps));
         st = vtable->query_caps(dev, &caps);
         if (st != VELRI_OK) {
             vtable->close_device(dev);
-            for (uint32_t j = start_dev; j < ctx->num_devices; ++j) {
-                ctx->devices[j].vt->close_device(ctx->devices[j].dev);
-            }
-            ctx->num_devices = start_dev;
-            return st;
+            goto rollback;
         }
         ctx->devices[ctx->num_devices].vt = vtable;
         ctx->devices[ctx->num_devices].dev = dev;
@@ -77,6 +75,15 @@ static velri_status register_backend_with_cfg(velri_context *ctx,
 
     ctx->backends[ctx->num_backends++] = vtable;
     return VELRI_OK;
+
+rollback:
+    for (uint32_t j = ctx->num_devices; j > start_dev; --j) {
+        velri_device_entry *e = &ctx->devices[j - 1U];
+        e->vt->close_device(e->dev);
+        memset(e, 0, sizeof(*e));
+    }
+    ctx->num_devices = start_dev;
+    return st;
 }
 
 velri_status velri_context_register_backend(velri_context *ctx,
@@ -107,6 +114,8 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
     velri_cpu_open_cfg cpu_cfg = {
         .workers = ctx->cfg.cpu_workers,
         .variant = ctx->cfg.cpu_variant,
+        .use_physical_cores = ctx->cfg.use_physical_cores,
+        .reserve_cores = ctx->cfg.cpu_reserve_cores,
     };
     velri_status st = register_backend_with_cfg(ctx, velri_cpu_backend_vtable(), &cpu_cfg);
     if (st != VELRI_OK) {
@@ -126,15 +135,12 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
 
 void velri_context_retain(velri_context *ctx) {
     if (ctx) {
-        atomic_fetch_add_explicit(&ctx->refcount, 1U, memory_order_relaxed);
+        velri_ref_inc(&ctx->refcount);
     }
 }
 
 void velri_context_release(velri_context *ctx) {
-    if (!ctx) {
-        return;
-    }
-    if (atomic_fetch_sub_explicit(&ctx->refcount, 1U, memory_order_acq_rel) != 1U) {
+    if (!ctx || !velri_ref_dec(&ctx->refcount)) {
         return;
     }
     for (uint32_t i = ctx->num_devices; i > 0U; --i) {

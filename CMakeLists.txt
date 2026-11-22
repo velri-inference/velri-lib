@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(VelriLib VERSION 0.1.0 LANGUAGES C)
+project(VelriLib VERSION 0.2.0 LANGUAGES C)
 include(GNUInstallDirs)
 
 set(CMAKE_C_STANDARD 23)
@@ -111,6 +111,13 @@ set(VELRI_SOURCES
     src/core/runtime_ctx.c
     src/ops/registry.c
     src/graph/graph.c
+    src/blocks/builder.c
+    src/blocks/norm.c
+    src/blocks/embedding.c
+    src/blocks/attention.c
+    src/blocks/mlp.c
+    src/blocks/lm_head.c
+    src/layers/pre_norm.c
     src/plan/planner.c
     src/runtime/executor.c
     src/backend/cpu/cpu_backend.c
@@ -118,8 +125,12 @@ set(VELRI_SOURCES
 )
 if(VELRI_ENABLE_VULKAN)
     list(APPEND VELRI_SOURCES
-        src/backend/vulkan/vk_backend.c
+        src/backend/vulkan/vk_device.c
+        src/backend/vulkan/vk_memory.c
+        src/backend/vulkan/vk_pipeline.c
+        src/backend/vulkan/vk_dispatch.c
         "${VELRI_VK_SHADER_HEADER}"
+        "${VELRI_VK_ABI_HEADER}"
     )
 endif()
 
@@ -137,9 +148,12 @@ target_include_directories(velri
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src/platform"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/core"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ops"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/blocks"
 )
 if(VELRI_ENABLE_VULKAN)
     target_include_directories(velri PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan"
         "${VELRI_SLANG_GEN_DIR}"
         "${VELRI_VULKAN_INCLUDE_DIR}"
     )

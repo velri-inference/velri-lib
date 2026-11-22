@@ -19,10 +19,9 @@ public void gated_mlp_cpu<A : IActivation>(
     uint i0, uint i1, float clamp_limit)
 {
     if (clamp_limit > 0.0f) {
-        float neg = -clamp_limit;
         for (uint i = i0; i < i1; ++i) {
-            float g = fast_clampf(gate[i], neg, clamp_limit);
-            float u = fast_clampf(up[i], neg, clamp_limit);
+            float g = apply_symmetric_clamp(gate[i], clamp_limit);
+            float u = apply_symmetric_clamp(up[i], clamp_limit);
             y[i] = A::apply(g) * u;
         }
     } else {
@@ -33,7 +32,7 @@ public void gated_mlp_cpu<A : IActivation>(
 }
 
 float row_max_f32_cpu(Ptr<float, Access.Read> xr, uint cols) {
-    float m = -3.4028234e38f;
+    float m = kNegInfSentinel;
     for (uint c = 0u; c < cols; ++c) {
         float v = xr[c];
         m = select(v > m, v, m);
@@ -46,7 +45,6 @@ public void softmax_rows_cpu(
     Ptr<float> y, uint y_stride,
     uint r0, uint r1, uint cols)
 {
-    static const float kNegInfCutoff = -3.4e38f;
     if (cols <= 4096u) {
         float tmp[4096];
         for (uint r = r0; r < r1; ++r) {
@@ -118,16 +116,12 @@ public void mul_cpu(
 void stockham_r4_cpu<let B : int>(Ptr<float> src, Ptr<float> dst) {
     static const uint kQ = uint(B) >> 2u;
     for (uint k = 0u; k < kQ; ++k) {
-        float a0 = src[k * 4u + 0u];
-        float a1 = src[k * 4u + 1u];
-        float a2 = src[k * 4u + 2u];
-        float a3 = src[k * 4u + 3u];
-        float t0 = a0 + a1, t1 = a0 - a1;
-        float t2 = a2 + a3, t3 = a2 - a3;
-        dst[k + 0u * kQ] = t0 + t2;
-        dst[k + 1u * kQ] = t1 + t3;
-        dst[k + 2u * kQ] = t0 - t2;
-        dst[k + 3u * kQ] = t1 - t3;
+        float4 h = hadamard4(float4(
+            src[k * 4u + 0u], src[k * 4u + 1u], src[k * 4u + 2u], src[k * 4u + 3u]));
+        dst[k + 0u * kQ] = h.x;
+        dst[k + 1u * kQ] = h.y;
+        dst[k + 2u * kQ] = h.z;
+        dst[k + 3u * kQ] = h.w;
     }
 }
 
@@ -162,22 +156,16 @@ void fwht_rows_b_cpu<let B : int, TSuh : IElement, let HAS_SUH : bool>(
         for (uint c0 = 0u; c0 < cols; c0 += kB) {
             for (uint k = 0u; k < kQ; ++k) {
                 uint base = c0 + k * 4u;
-                float a0 = xr[base + 0u] * norm;
-                float a1 = xr[base + 1u] * norm;
-                float a2 = xr[base + 2u] * norm;
-                float a3 = xr[base + 3u] * norm;
+                float4 a = float4(
+                    xr[base + 0u], xr[base + 1u], xr[base + 2u], xr[base + 3u]) * norm;
                 if (HAS_SUH) {
-                    a0 *= TSuh::toF32(suh[base + 0u]);
-                    a1 *= TSuh::toF32(suh[base + 1u]);
-                    a2 *= TSuh::toF32(suh[base + 2u]);
-                    a3 *= TSuh::toF32(suh[base + 3u]);
+                    a *= TSuh::load4F32(suh + base);
                 }
-                float t0 = a0 + a1, t1 = a0 - a1;
-                float t2 = a2 + a3, t3 = a2 - a3;
-                pa[k + 0u * kQ] = t0 + t2;
-                pa[k + 1u * kQ] = t1 + t3;
-                pa[k + 2u * kQ] = t0 - t2;
-                pa[k + 3u * kQ] = t1 - t3;
+                float4 h = hadamard4(a);
+                pa[k + 0u * kQ] = h.x;
+                pa[k + 1u * kQ] = h.y;
+                pa[k + 2u * kQ] = h.z;
+                pa[k + 3u * kQ] = h.w;
             }
             if (B == 16) {
                 stockham_r4_cpu<16>(pa, yr + c0);
@@ -232,26 +220,16 @@ public void quantize_rows_f32_i8_cpu(
         Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
         Ptr<int8_t> qr = x_i8 + uint64_t(r) * uint64_t(xi8_stride);
         float amax = row_max_abs_f32_cpu(xr, cols);
-        if (amax >= 1.0e-35f) {
-            float scale = amax / 127.0f;
-            float inv_scale = 127.0f / amax;
-            scale_out[r] = scale;
-            for (uint c = 0u; c < cols; ++c) {
-                float v = fast_clampf(round(xr[c] * inv_scale), -127.0f, 127.0f);
-                qr[c] = int8_t(int(v));
-            }
-        } else if (amax > 0.0f) {
-            // Tiny positive row where 127.0f / amax would overflow to +inf: divide safely by scale.
-            float scale = max(amax / 127.0f, 1.17549435e-38f);
-            scale_out[r] = scale;
-            for (uint c = 0u; c < cols; ++c) {
-                float v = fast_clampf(round(xr[c] / scale), -127.0f, 127.0f);
-                qr[c] = int8_t(int(v));
-            }
-        } else {
-            scale_out[r] = 1.0f;
+        float scale, inv_scale;
+        compute_sym_i8_scale(amax, scale, inv_scale);
+        scale_out[r] = scale;
+        if (inv_scale == 0.0f) {
             for (uint c = 0u; c < cols; ++c) {
                 qr[c] = int8_t(0);
+            }
+        } else {
+            for (uint c = 0u; c < cols; ++c) {
+                qr[c] = quantize_sym_i8(xr[c], inv_scale);
             }
         }
     }

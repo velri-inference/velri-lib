@@ -22,7 +22,8 @@ enum {
     VELRI_MAX_RANK = 4,
     VELRI_INVALID_ID = 0xFFFFFFFFU,
     VELRI_OP_MAX_INPUTS = 6,
-    VELRI_OP_MAX_OUTPUTS = 3
+    VELRI_OP_MAX_OUTPUTS = 3,
+    VELRI_ATTN_MAX_HEAD_DIM = 2048
 };
 
 typedef uint32_t velri_storage_id;
@@ -86,7 +87,11 @@ typedef enum {
     VELRI_OP_VEC_AXPBY = 8,
     VELRI_OP_VEC_MUL = 9,
     VELRI_OP_FWHT = 10,
-    VELRI_OP_QUANTIZE_ROW = 11
+    VELRI_OP_QUANTIZE_ROW = 11,
+    VELRI_OP_EMBEDDING = 12,
+    VELRI_OP_ATTENTION = 13,
+    VELRI_OP_COPY_LAST_ROW = 14,
+    VELRI_OP_BATCHED_LINEAR = 15
 } velri_op_kind;
 
 typedef struct {
@@ -95,6 +100,7 @@ typedef struct {
     uint32_t num_outputs;
     velri_view_id inputs[VELRI_OP_MAX_INPUTS]; /* VELRI_INVALID_ID for optional absent inputs */
     velri_view_id outputs[VELRI_OP_MAX_OUTPUTS];
+    bool dynamic_seq; /* True => axis-0 scales dynamically with seq_len_override (EMBEDDING, ATTENTION, COPY_LAST_ROW are always dynamic-seq) */
     union {
         struct {
             velri_linear_desc desc;
@@ -126,6 +132,25 @@ typedef struct {
             size_t block_size;
             velri_dtype suh_dtype;
         } fwht;
+        struct {
+            size_t pos_offset; /* Used when inputs[1] (`ids`) is absent (positional lookup) */
+        } embedding;
+        struct {
+            uint32_t n_heads;
+            uint32_t n_kv_heads;
+            uint32_t head_dim;       /* Key/query dim d_k (1..VELRI_ATTN_MAX_HEAD_DIM) */
+            uint32_t v_head_dim;     /* Value/output dim d_v (0 => head_dim; 1..VELRI_ATTN_MAX_HEAD_DIM) */
+            float scale;             /* 0.0f => 1.0f / sqrtf((float)head_dim) */
+            uint32_t sliding_window; /* 0 => full causal history */
+            bool causal;
+        } attention;
+        struct {
+            uint32_t n_heads;       /* Batch count per token row (B >= 1) */
+            uint32_t n_groups;      /* Weight groups (G >= 1, B % G == 0) */
+            uint32_t in_dim;        /* Input features per head (K >= 1) */
+            uint32_t out_dim;       /* Output features per head (M >= 1) */
+            bool weight_transposed; /* false: W [G*M, K] (Y = X @ W^T + b); true: W [G*K, M] (Y = X @ W + b) */
+        } batched_linear;
     } attr;
 } velri_op_desc;
 
@@ -149,6 +174,10 @@ typedef struct {
 typedef struct {
     size_t pos_offset_override;
     bool has_pos_offset;
+    size_t seq_len_override; /* Dynamic active rows 1..max_seq_len (must be >= 1 when has_seq_len) */
+    bool has_seq_len;
+    size_t kv_len_override;  /* Valid KV cache length BEFORE appending this step's tokens */
+    bool has_kv_len;
 } velri_step_params;
 
 typedef struct {
@@ -157,6 +186,9 @@ typedef struct {
 
 static inline void velri_cancel_init(velri_cancel_token *tok) {
     if (tok) atomic_init(&tok->cancelled, false);
+}
+static inline void velri_cancel_clear(velri_cancel_token *tok) {
+    if (tok) atomic_store_explicit(&tok->cancelled, false, memory_order_release);
 }
 static inline void velri_cancel_request(velri_cancel_token *tok) {
     if (tok) atomic_store_explicit(&tok->cancelled, true, memory_order_release);
@@ -174,11 +206,13 @@ typedef struct {
     bool mem_total_known;   /* False if driver does not report reliable memory size */
     size_t mem_total_bytes; /* 0 if !mem_total_known */
     size_t min_align_bytes; /* Required base allocation alignment */
+    uint32_t cpu_workers;   /* Actual pool size, including the caller; 0 on other devices */
 } velri_device_caps;
 
 typedef struct velri_backend_device velri_backend_device;
 typedef struct velri_prepared_op velri_prepared_op;
 typedef struct velri_completion velri_completion;
+typedef struct velri_captured_graph velri_captured_graph;
 
 typedef struct {
     const velri_resolved_op *op;
@@ -188,6 +222,9 @@ typedef struct {
     const velri_buffer_binding *outputs;
     uint32_t num_outputs;
     const velri_step_params *params;
+    /* DAG barrier hint (default false => conservative barrier before item; true => planner proved
+     * zero RAW/WAR/WAW hazard against preceding un-barriered items in this batch). */
+    bool no_barrier_before;
 } velri_submit_item;
 
 /*
@@ -237,6 +274,15 @@ typedef struct velri_backend_vtable {
     /* 6. Completion (optional pair for asynchronous backends) */
     velri_status (*wait)(velri_backend_device *dev, velri_completion *comp);
     void (*destroy_completion)(velri_backend_device *dev, velri_completion *comp);
+
+    /* 7. Optional Persistent Launch-Graph Capture (all 3 provided together or all nullptr) */
+    velri_status (*capture_graph)(velri_backend_device *dev, const velri_submit_item *items,
+                                  uint32_t count, velri_captured_graph **out_graph); /* opt */
+    void (*destroy_captured_graph)(velri_backend_device *dev,
+                                   velri_captured_graph *graph); /* opt */
+    velri_status (*replay_graph)(velri_backend_device *dev, velri_captured_graph *graph,
+                                 const velri_step_params *params,
+                                 velri_completion **out_completion); /* opt */
 } velri_backend_vtable;
 
 /* Runtime context owning statically registered backends and open devices. */
@@ -246,6 +292,8 @@ typedef struct {
     size_t cpu_workers;            /* 0 => auto */
     velri_cpu_variant cpu_variant; /* VELRI_CPU_AUTO by default */
     bool enable_vulkan;            /* Try opening Vulkan devices if compiled with Vulkan */
+    bool use_physical_cores;       /* When cpu_workers == 0, count accessible physical cores */
+    uint32_t cpu_reserve_cores;    /* Subtracted in physical-core mode; at least one worker */
 } velri_context_config;
 
 velri_status velri_context_create(const velri_context_config *cfg, velri_context **out_ctx);

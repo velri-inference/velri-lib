@@ -24,6 +24,7 @@ set(VELRI_SLANG_COMMON_DEPS
     "${VELRI_SLANG_DIR}/common/numeric.slang"
     "${VELRI_SLANG_DIR}/common/activations.slang"
     "${VELRI_SLANG_DIR}/common/epilogue.slang"
+    "${VELRI_SLANG_DIR}/common/key_iter.slang"
 )
 set(VELRI_SLANG_CPU_DEPS
     ${VELRI_SLANG_COMMON_DEPS}
@@ -31,10 +32,14 @@ set(VELRI_SLANG_CPU_DEPS
     "${VELRI_SLANG_DIR}/ops/rope.slang"
     "${VELRI_SLANG_DIR}/ops/elementwise.slang"
     "${VELRI_SLANG_DIR}/ops/linear_cpu.slang"
+    "${VELRI_SLANG_DIR}/ops/gather_copy.slang"
+    "${VELRI_SLANG_DIR}/ops/attention.slang"
+    "${VELRI_SLANG_DIR}/ops/batched_linear.slang"
 )
 set(VELRI_SLANG_VK_DEPS
     ${VELRI_SLANG_COMMON_DEPS}
     "${VELRI_SLANG_DIR}/common/reductions.slang"
+    "${VELRI_SLANG_DIR}/common/reductions_wide.slang"
 )
 
 set(_velri_obj_ext "${CMAKE_C_OUTPUT_EXTENSION}")
@@ -269,14 +274,22 @@ endif()
 # ============================================================================
 # 2. Slang AOT Vulkan SPIR-V 1.6 Shaders (optional)
 # ============================================================================
-function(velri_compile_vk_shaders out_header spv_dir header_path spec_list)
+function(velri_compile_vk_shaders out_header spv_dir header_path spec_list abi_header)
     file(MAKE_DIRECTORY "${spv_dir}")
     set(_entries)
     set(_spvs)
+    set(_reflections)
     foreach(_spec IN LISTS spec_list)
         string(REGEX REPLACE "\\|.*$" "" _src_path "${_spec}")
         string(REGEX REPLACE "^.*\\|" "" _entry "${_spec}")
         set(_spv "${spv_dir}/${_entry}.spv")
+        set(_reflect_args)
+        set(_reflect_output)
+        if(abi_header)
+            set(_reflect_output "${spv_dir}/${_entry}.json")
+            set(_reflect_args -reflection-json "${_reflect_output}")
+            list(APPEND _reflections "${_reflect_output}")
+        endif()
         set(_extra_caps)
         if(_entry STREQUAL "vk_gemm_coopmat_bf16" OR _entry STREQUAL "vk_gemm_coopmat_bf16_64" OR
            _entry STREQUAL "vk_ceiling_coopmat_bf16")
@@ -290,11 +303,11 @@ function(velri_compile_vk_shaders out_header spv_dir header_path spec_list)
             set(_spv_comment "Slang AOT SPIR-V + spirv-val: ${_entry}.spv")
         endif()
         add_custom_command(
-            OUTPUT "${_spv}"
+            OUTPUT "${_spv}" ${_reflect_output}
             COMMAND "${VELRI_SLANGC}" "${_src_path}"
                 -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/vk"
                 -target spirv -profile spirv_1_6 -Wno-41012 -fvk-use-c-layout -O3
-                ${_extra_caps}
+                ${_extra_caps} ${_reflect_args}
                 -entry "${_entry}" -stage compute -o "${_spv}"
             ${_val_cmd}
             DEPENDS "${_src_path}" "${VELRI_SLANG_DIR}/vk/vk_common.slang" ${VELRI_SLANG_VK_DEPS}
@@ -317,6 +330,16 @@ function(velri_compile_vk_shaders out_header spv_dir header_path spec_list)
         COMMENT "Embedding SPIR-V shaders -> ${header_path}"
         VERBATIM
     )
+    if(abi_header)
+        add_custom_command(
+            OUTPUT "${abi_header}"
+            COMMAND "${CMAKE_COMMAND}" "-DINPUTS=${_reflections}" "-DOUTPUT=${abi_header}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vk_abi.cmake"
+            DEPENDS ${_reflections} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vk_abi.cmake"
+            COMMENT "Generating Vulkan push-constant layouts from Slang reflection"
+            VERBATIM
+        )
+    endif()
     set(${out_header} "${header_path}" PARENT_SCOPE)
 endfunction()
 
@@ -366,11 +389,22 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_f16_64"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_bf16_64"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_w8a8_64"
+        "${_vk}/gather_copy.slang|vk_embedding_f32"
+        "${_vk}/gather_copy.slang|vk_copy_last_row_f32"
+        "${_vk}/attention.slang|vk_kv_append_f32"
+        "${_vk}/attention.slang|vk_attention_decode_f32"
+        "${_vk}/attention.slang|vk_attention_prefill_f32"
+        "${_vk}/attention.slang|vk_attention_wide_f32"
+        "${_vk}/attention.slang|vk_attention_splitkv_f32"
+        "${_vk}/attention.slang|vk_attention_splitkv_reduce_f32"
+        "${_vk}/batched_linear.slang|vk_batched_linear_nt_f32"
+        "${_vk}/batched_linear.slang|vk_batched_linear_nn_f32"
     )
+    set(VELRI_VK_ABI_HEADER "${VELRI_SLANG_GEN_DIR}/velri_vk_abi.h")
     velri_compile_vk_shaders(VELRI_VK_SHADER_HEADER
         "${VELRI_SLANG_GEN_DIR}/spv"
         "${VELRI_SLANG_GEN_DIR}/velri_vk_shaders.h"
-        "${VELRI_VK_PROD_SPECS}"
+        "${VELRI_VK_PROD_SPECS}" "${VELRI_VK_ABI_HEADER}"
     )
 
     if(VELRI_BUILD_BENCHMARKS)
@@ -386,7 +420,7 @@ if(VELRI_ENABLE_VULKAN)
         velri_compile_vk_shaders(VELRI_VK_CEILING_HEADER
             "${VELRI_SLANG_GEN_DIR}/spv_bench"
             "${VELRI_SLANG_GEN_DIR}/velri_vk_ceilings.h"
-            "${VELRI_VK_CEIL_SPECS}"
+            "${VELRI_VK_CEIL_SPECS}" ""
         )
     endif()
 endif()

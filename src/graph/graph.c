@@ -38,14 +38,16 @@ velri_status velri_graph_add_storage(velri_graph *graph, const velri_storage_des
     if (velri_dtype_bytes(desc->dtype) == 0U) {
         return VELRI_ERR_INVALID;
     }
-    if (desc->align != 0U && (desc->align & (desc->align - 1U)) != 0U) {
+    if (desc->align != 0U && !velri_is_pow2(desc->align)) {
         return VELRI_ERR_INVALID;
     }
-    if (graph->num_storages == UINT32_MAX ||
-        !velri_vec_grow((void **)&graph->storages, &graph->cap_storages,
-                        graph->num_storages + 1U, sizeof(velri_storage_desc))) {
+
+    void *buf = nullptr;
+    if (!velri_vec_ensure(graph->storages, &buf, &graph->cap_storages, graph->num_storages, 1U,
+                          sizeof(velri_storage_desc))) {
         return VELRI_ERR_NOMEM;
     }
+    graph->storages = (velri_storage_desc *)buf;
 
     uint32_t id = graph->num_storages++;
     graph->storages[id] = *desc;
@@ -65,11 +67,14 @@ velri_status velri_graph_add_view(velri_graph *graph, const velri_tensor_view *v
     if (st != VELRI_OK) {
         return st;
     }
-    if (graph->num_views == UINT32_MAX ||
-        !velri_vec_grow((void **)&graph->views, &graph->cap_views,
-                        graph->num_views + 1U, sizeof(velri_tensor_view))) {
+
+    void *buf = nullptr;
+    if (!velri_vec_ensure(graph->views, &buf, &graph->cap_views, graph->num_views, 1U,
+                          sizeof(velri_tensor_view))) {
         return VELRI_ERR_NOMEM;
     }
+    graph->views = (velri_tensor_view *)buf;
+
     uint32_t id = graph->num_views++;
     graph->views[id] = *view;
     *out_id = id;
@@ -126,11 +131,13 @@ velri_status velri_graph_add_op(velri_graph *graph, const velri_op_desc *op,
         return st;
     }
 
-    if (graph->num_nodes == UINT32_MAX ||
-        !velri_vec_grow((void **)&graph->nodes, &graph->cap_nodes,
-                        graph->num_nodes + 1U, sizeof(velri_graph_node))) {
+    void *buf = nullptr;
+    if (!velri_vec_ensure(graph->nodes, &buf, &graph->cap_nodes, graph->num_nodes, 1U,
+                          sizeof(velri_graph_node))) {
         return VELRI_ERR_NOMEM;
     }
+    graph->nodes = (velri_graph_node *)buf;
+
     uint32_t nid = graph->num_nodes++;
     graph->nodes[nid].desc = *op;
     graph->nodes[nid].device_id = device_id;

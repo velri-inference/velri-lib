@@ -22,6 +22,7 @@ typedef struct {
     atomic_uint total_completed;
     atomic_uint total_uploads;
     atomic_uint total_downloads;
+    atomic_uint total_allocs;
 } velri_mock_async_ctrl;
 
 const velri_backend_vtable *velri_mock_async_backend_vtable(void);

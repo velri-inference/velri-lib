@@ -3,8 +3,11 @@ import numeric;
 import epilogue;
 import vk_common;
 
-groupshared float4 s_f32_a[2 * 8 * 33];
-groupshared float4 s_f32_b[2 * 8 * 33];
+static const uint kSmemStride = 33u;
+static const uint kSmemStageElems = 8u * kSmemStride;
+
+groupshared float4 s_f32_a[2u * kSmemStageElems];
+groupshared float4 s_f32_b[2u * kSmemStageElems];
 
 float4 load_f32x4_safe(Ptr<float, Access.Read> base, uint row, uint row_lim,
                        uint k, uint k_lim, uint stride, bool aligned4)
@@ -21,18 +24,16 @@ float4 load_f32x4_safe(Ptr<float, Access.Read> base, uint row, uint row_lim,
         (k + 3u < k_lim) ? base[off + 3u] : 0.0f);
 }
 
-void store_f32_transposed_a(uint sb, uint comp, float4 v) {
-    s_f32_a[sb +  0u][comp] = v.x;
-    s_f32_a[sb + 33u][comp] = v.y;
-    s_f32_a[sb + 66u][comp] = v.z;
-    s_f32_a[sb + 99u][comp] = v.w;
+void store_f32_elem<let IS_B : bool>(uint idx, uint comp, float val) {
+    if (IS_B) s_f32_b[idx][comp] = val;
+    else      s_f32_a[idx][comp] = val;
 }
 
-void store_f32_transposed_b(uint sb, uint comp, float4 v) {
-    s_f32_b[sb +  0u][comp] = v.x;
-    s_f32_b[sb + 33u][comp] = v.y;
-    s_f32_b[sb + 66u][comp] = v.z;
-    s_f32_b[sb + 99u][comp] = v.w;
+void store_f32_transposed<let IS_B : bool>(uint sb, uint comp, float4 v) {
+    store_f32_elem<IS_B>(sb + 0u * kSmemStride, comp, v.x);
+    store_f32_elem<IS_B>(sb + 1u * kSmemStride, comp, v.y);
+    store_f32_elem<IS_B>(sb + 2u * kSmemStride, comp, v.z);
+    store_f32_elem<IS_B>(sb + 3u * kSmemStride, comp, v.w);
 }
 
 void f32_outer_8x8(inout float4 acc0[8], inout float4 acc1[8],
@@ -50,8 +51,8 @@ void f32_outer_8x8(inout float4 acc0[8], inout float4 acc1[8],
 
 void f32_gemm_mma8(inout float4 acc0[8], inout float4 acc1[8], uint sbase, uint a_col, uint b_col) {
     [ForceUnroll] for (uint kk = 0u; kk < 8u; kk += 2u) {
-        uint off0 = sbase + kk * 33u;
-        uint off1 = off0 + 33u;
+        uint off0 = sbase + kk * kSmemStride;
+        uint off1 = off0 + kSmemStride;
         float4 a0_0 = s_f32_a[off0 + a_col];
         float4 a1_0 = s_f32_a[off0 + a_col + 4u];
         float4 b0_0 = s_f32_b[off0 + b_col];
@@ -66,61 +67,47 @@ void f32_gemm_mma8(inout float4 acc0[8], inout float4 acc1[8], uint sbase, uint 
 }
 
 void f32_gemm_store_epilogue(
-    uniform GemvArgs<ElemF32, ElemF32, ElemF32> a,
+    uniform LinearArgs<float, float, float> a,
     Ptr<float> y_out, uint flags_eff,
     float4 acc0[8], float4 acc1[8],
     uint row0, uint col0, uint a_col, uint b_col)
 {
-    EpilogueParams ep = make_vk_ep(a.bias, a.x_scale, a.w_scale, flags_eff);
+    EpilogueParams ep = make_epilogue_params(a.bias, a.x_scale, a.w_scale, flags_eff);
     bool y_vec = is_ptr_aligned16(y_out) && ((a.y_stride & 3u) == 0u);
-    bool has_bias = ep.has_bias != 0u;
-    bool bias_vec = has_bias && is_ptr_aligned16(a.bias);
 
     uint r_base0 = row0 + a_col * 4u;
     uint r_base1 = r_base0 + 16u;
     uint c0 = col0 + b_col * 4u;
     uint c1 = c0 + 32u;
 
+    bool c0_vec = y_vec && (c0 + 4u <= a.m);
+    bool c1_vec = y_vec && (c1 + 4u <= a.m);
     float4 bias0 = float4(0.0f);
     float4 bias1 = float4(0.0f);
-    if (has_bias) {
-        if (c0 + 4u <= a.m) {
-            bias0 = bias_vec ? load_a16(Ptr<float4, Access.Read>(a.bias + c0))
-                             : float4(a.bias[c0], a.bias[c0 + 1u], a.bias[c0 + 2u], a.bias[c0 + 3u]);
-        }
-        if (c1 + 4u <= a.m) {
-            bias1 = bias_vec ? load_a16(Ptr<float4, Access.Read>(a.bias + c1))
-                             : float4(a.bias[c1], a.bias[c1 + 1u], a.bias[c1 + 2u], a.bias[c1 + 3u]);
-        }
+    if (ep.has_bias != 0u) {
+        if (c0_vec) bias0 = load_f32x4_maybe_a16(a.bias + c0);
+        if (c1_vec) bias1 = load_f32x4_maybe_a16(a.bias + c1);
     }
 
     [ForceUnroll] for (uint i = 0u; i < 8u; ++i) {
         uint r = (i < 4u) ? (r_base0 + i) : (r_base1 + (i - 4u));
         if (r >= a.rows) continue;
         Ptr<float> yr = y_out + uint64_t(r) * uint64_t(a.y_stride);
-        if (y_vec && c0 + 4u <= a.m) {
+        if (c0_vec) {
             store_a16(Ptr<float4>(yr + c0), acc0[i] + bias0);
         } else {
-            float4 v0 = acc0[i];
-            if (c0 + 0u < a.m) yr[c0 + 0u] = EpBias::apply(v0.x, r, c0 + 0u, ep);
-            if (c0 + 1u < a.m) yr[c0 + 1u] = EpBias::apply(v0.y, r, c0 + 1u, ep);
-            if (c0 + 2u < a.m) yr[c0 + 2u] = EpBias::apply(v0.z, r, c0 + 2u, ep);
-            if (c0 + 3u < a.m) yr[c0 + 3u] = EpBias::apply(v0.w, r, c0 + 3u, ep);
+            store_epilogue_f32x4<EpBias>(yr, r, c0, a.m, false, acc0[i], ep);
         }
-        if (y_vec && c1 + 4u <= a.m) {
+        if (c1_vec) {
             store_a16(Ptr<float4>(yr + c1), acc1[i] + bias1);
         } else {
-            float4 v1 = acc1[i];
-            if (c1 + 0u < a.m) yr[c1 + 0u] = EpBias::apply(v1.x, r, c1 + 0u, ep);
-            if (c1 + 1u < a.m) yr[c1 + 1u] = EpBias::apply(v1.y, r, c1 + 1u, ep);
-            if (c1 + 2u < a.m) yr[c1 + 2u] = EpBias::apply(v1.z, r, c1 + 2u, ep);
-            if (c1 + 3u < a.m) yr[c1 + 3u] = EpBias::apply(v1.w, r, c1 + 3u, ep);
+            store_epilogue_f32x4<EpBias>(yr, r, c1, a.m, false, acc1[i], ep);
         }
     }
 }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void vk_gemm_f32(uniform GemvArgs<ElemF32, ElemF32, ElemF32> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemm_f32(uniform LinearArgs<float, float, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint tid = gtid.x;
     uint grid_x = (a.m + 127u) >> 7u;
     uint grid_y = (a.rows + 127u) >> 7u;
@@ -139,7 +126,7 @@ void vk_gemm_f32(uniform GemvArgs<ElemF32, ElemF32, ElemF32> a, uint3 gtid : SV_
 
     uint l_lk = (tid & 1u) << 2u;
     uint lr = tid >> 1u;
-    uint s_off = l_lk * 33u + (lr >> 2u);
+    uint s_off = l_lk * kSmemStride + (lr >> 2u);
     uint s_comp = lr & 3u;
 
     float4 acc0[8];
@@ -175,8 +162,8 @@ void vk_gemm_f32(uniform GemvArgs<ElemF32, ElemF32, ElemF32> a, uint3 gtid : SV_
         Ptr<float4, Access.Read> xp = Ptr<float4, Access.Read>(x_base + uint64_t(row0 + lr) * uint64_t(a.x_stride) + uint64_t(l_lk));
         Ptr<float4, Access.Read> wp = Ptr<float4, Access.Read>(w_base + uint64_t(col0 + lr) * uint64_t(a.w_stride) + uint64_t(l_lk));
 
-        store_f32_transposed_a(s_off, s_comp, load_a16(xp));
-        store_f32_transposed_b(s_off, s_comp, load_a16(wp));
+        store_f32_transposed<false>(s_off, s_comp, load_a16(xp));
+        store_f32_transposed<true>(s_off, s_comp, load_a16(wp));
         GroupMemoryBarrierWithGroupSync();
 
         uint stage = 0u;
@@ -184,22 +171,22 @@ void vk_gemm_f32(uniform GemvArgs<ElemF32, ElemF32, ElemF32> a, uint3 gtid : SV_
             uint k_u4 = (kt + 1u) << 1u;
             float4 pA = load_a16(xp + k_u4);
             float4 pB = load_a16(wp + k_u4);
-            uint sbase = stage * (8u * 33u);
+            uint sbase = stage * kSmemStageElems;
             f32_gemm_mma8(acc0, acc1, sbase, a_col, b_col);
-            uint nbase = (stage ^ 1u) * (8u * 33u);
-            store_f32_transposed_a(nbase + s_off, s_comp, pA);
-            store_f32_transposed_b(nbase + s_off, s_comp, pB);
+            uint nbase = (stage ^ 1u) * kSmemStageElems;
+            store_f32_transposed<false>(nbase + s_off, s_comp, pA);
+            store_f32_transposed<true>(nbase + s_off, s_comp, pB);
             GroupMemoryBarrierWithGroupSync();
             stage ^= 1u;
         }
-        f32_gemm_mma8(acc0, acc1, stage * (8u * 33u), a_col, b_col);
+        f32_gemm_mma8(acc0, acc1, stage * kSmemStageElems, a_col, b_col);
     } else {
         for (uint kt = 0u; kt < num_k_tiles; ++kt) {
             uint k0 = kt << 3u;
             float4 va = load_f32x4_safe(x_base, row0 + lr, a.rows, k0 + l_lk, k_len, a.x_stride, aligned4);
             float4 vb = load_f32x4_safe(w_base, col0 + lr, a.m,    k0 + l_lk, k_len, a.w_stride, aligned4);
-            store_f32_transposed_a(s_off, s_comp, va);
-            store_f32_transposed_b(s_off, s_comp, vb);
+            store_f32_transposed<false>(s_off, s_comp, va);
+            store_f32_transposed<true>(s_off, s_comp, vb);
             GroupMemoryBarrierWithGroupSync();
             f32_gemm_mma8(acc0, acc1, 0u, a_col, b_col);
             GroupMemoryBarrierWithGroupSync();
@@ -221,13 +208,11 @@ struct SplitKReduceArgs {
     uint y_stride;
     uint split_k;
     uint flags;
-    uint is_int32;
-    uint pad;
 };
 
 [shader("compute")] [numthreads(256, 1, 1)]
 void vk_splitk_reduce(uniform SplitKReduceArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    uint idx = gid.x * 256u + gtid.x;
+    uint idx = gid.x * kRowWgSize + gtid.x;
     uint64_t slice_u4 = uint64_t(a.rows) * uint64_t(a.part_stride_u4);
     if (uint64_t(idx) >= slice_u4) return;
 
@@ -240,22 +225,8 @@ void vk_splitk_reduce(uniform SplitKReduceArgs a, uint3 gtid : SV_GroupThreadID,
         fv += asfloat(load_a16(a.partials + uint64_t(s) * slice_u4 + uint64_t(idx)));
     }
 
-    EpilogueParams ep = make_vk_ep(a.bias, a.x_scale, a.w_scale, a.flags);
+    EpilogueParams ep = make_epilogue_params(a.bias, a.x_scale, a.w_scale, a.flags);
     bool y_vec = is_ptr_aligned16(a.y) && ((a.y_stride & 3u) == 0u);
     Ptr<float> yr = a.y + uint64_t(gr) * uint64_t(a.y_stride);
-    if (y_vec && gc + 4u <= a.m) {
-        float4 outv = fv;
-        if (ep.has_bias != 0u) {
-            float4 bv = is_ptr_aligned16(ep.bias)
-                        ? load_a16(Ptr<float4, Access.Read>(ep.bias + gc))
-                        : float4(ep.bias[gc], ep.bias[gc + 1u], ep.bias[gc + 2u], ep.bias[gc + 3u]);
-            outv += bv;
-        }
-        store_a16(Ptr<float4>(yr + gc), outv);
-    } else {
-        if (gc + 0u < a.m) yr[gc + 0u] = EpBias::apply(fv.x, gr, gc + 0u, ep);
-        if (gc + 1u < a.m) yr[gc + 1u] = EpBias::apply(fv.y, gr, gc + 1u, ep);
-        if (gc + 2u < a.m) yr[gc + 2u] = EpBias::apply(fv.z, gr, gc + 2u, ep);
-        if (gc + 3u < a.m) yr[gc + 3u] = EpBias::apply(fv.w, gr, gc + 3u, ep);
-    }
+    store_epilogue_f32x4<EpBias>(yr, gr, gc, a.m, y_vec, fv, ep);
 }

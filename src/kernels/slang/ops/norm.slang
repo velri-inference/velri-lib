@@ -1,17 +1,32 @@
-// Shared RMSNorm, Fused Residual+RMSNorm, and LayerNorm math.
-// Reuses common/numeric.slang (IElement) across all dtypes and CPU/Vulkan targets.
+// Shared RMSNorm, Fused Residual+RMSNorm, and LayerNorm math for CPU.
+// Reuses common/numeric.slang (IElement) across all dtypes.
 module norm;
 
 import numeric;
 
-public float rmsnorm_scale_weight<TW : IElement>(
-    Ptr<TW.Storage, Access.Read> weight, uint has_weight, uint unit_offset, uint d)
+void rmsnorm_apply_row_cpu<TIO : IElement, TW : IElement>(
+    Ptr<TIO.Storage, Access.Read> src,
+    Ptr<TW.Storage, Access.Read> weight, uint has_weight,
+    Ptr<TIO.Storage> dst,
+    uint dim, float inv_rms, uint unit_offset)
 {
-    float w = (has_weight != 0u) ? TW::toF32(weight[d]) : 1.0f;
-    if (has_weight != 0u && unit_offset != 0u) {
-        w += 1.0f;
+    if (has_weight != 0u) {
+        if (unit_offset != 0u) {
+            for (uint d = 0u; d < dim; ++d) {
+                float v = TIO::toF32(src[d]) * inv_rms * (1.0f + TW::toF32(weight[d]));
+                dst[d] = TIO::fromF32(v);
+            }
+        } else {
+            for (uint d = 0u; d < dim; ++d) {
+                float v = TIO::toF32(src[d]) * inv_rms * TW::toF32(weight[d]);
+                dst[d] = TIO::fromF32(v);
+            }
+        }
+    } else {
+        for (uint d = 0u; d < dim; ++d) {
+            dst[d] = TIO::fromF32(TIO::toF32(src[d]) * inv_rms);
+        }
     }
-    return w;
 }
 
 public void rmsnorm_rows_cpu<TIO : IElement, TW : IElement>(
@@ -30,23 +45,7 @@ public void rmsnorm_rows_cpu<TIO : IElement, TW : IElement>(
             sum_sq += v * v;
         }
         float inv_rms = 1.0f / sqrt(sum_sq * inv_dim + eps);
-        if (has_weight != 0u) {
-            if (unit_offset != 0u) {
-                for (uint d = 0u; d < dim; ++d) {
-                    float v = TIO::toF32(xr[d]) * inv_rms * (1.0f + TW::toF32(weight[d]));
-                    yr[d] = TIO::fromF32(v);
-                }
-            } else {
-                for (uint d = 0u; d < dim; ++d) {
-                    float v = TIO::toF32(xr[d]) * inv_rms * TW::toF32(weight[d]);
-                    yr[d] = TIO::fromF32(v);
-                }
-            }
-        } else {
-            for (uint d = 0u; d < dim; ++d) {
-                yr[d] = TIO::fromF32(TIO::toF32(xr[d]) * inv_rms);
-            }
-        }
+        rmsnorm_apply_row_cpu<TIO, TW>(xr, weight, has_weight, yr, dim, inv_rms, unit_offset);
     }
 }
 
@@ -69,15 +68,8 @@ public void fused_add_rmsnorm_rows_cpu(
             sum_sq += s * s;
         }
         float inv_rms = 1.0f / sqrt(sum_sq * inv_dim + eps);
-        if (has_weight != 0u) {
-            if (unit_offset != 0u) {
-                for (uint d = 0u; d < dim; ++d) yr[d] = rr[d] * inv_rms * (1.0f + weight[d]);
-            } else {
-                for (uint d = 0u; d < dim; ++d) yr[d] = rr[d] * inv_rms * weight[d];
-            }
-        } else {
-            for (uint d = 0u; d < dim; ++d) yr[d] = rr[d] * inv_rms;
-        }
+        rmsnorm_apply_row_cpu<ElemF32, ElemF32>(
+            Ptr<float, Access.Read>(rr), weight, has_weight, yr, dim, inv_rms, unit_offset);
     }
 }
 

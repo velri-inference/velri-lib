@@ -1,9 +1,14 @@
-// Shared Vulkan BDA 128-bit load/store helpers, IVecIO128 unpackers, and tile swizzling.
+// Shared Vulkan BDA 128-bit load/store helpers, IVecIO128 unpackers,
+// tile swizzling, epilogue stores, and unified LinearArgs push constants.
 module vk_common;
 
 import numeric;
 import activations;
 import epilogue;
+
+public static const uint kRowWgSize = 256u;
+public static const uint kRowRegCacheMaxDim = 4096u;
+public static const uint kGemvWgSize = 128u;
 
 public bool is_ptr_aligned16<T, let A : Access>(Ptr<T, A> p) {
     uint64_t addr = spirv_asm { result : $$uint64_t = OpConvertPtrToU $p; };
@@ -23,17 +28,64 @@ public void store_a16<T>(Ptr<T> p, T v) {
     spirv_asm { OpStore $p $v Aligned 16; };
 }
 
-public EpilogueParams make_vk_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> xs,
-                                 Ptr<float, Access.Read> ws, uint flags)
+public float4 load_f32x4_maybe_a16(Ptr<float, Access.Read> p) {
+    if (is_ptr_aligned16(p)) {
+        return load_a16(Ptr<float4, Access.Read>(p));
+    }
+    return float4(p[0], p[1], p[2], p[3]);
+}
+
+public void store_f32x4_maybe_a16(Ptr<float> p, float4 v) {
+    if (is_ptr_aligned16(p)) {
+        store_a16(Ptr<float4>(p), v);
+    } else {
+        p[0] = v.x;
+        p[1] = v.y;
+        p[2] = v.z;
+        p[3] = v.w;
+    }
+}
+
+public void copy_f32_chunk4(
+    Ptr<float, Access.Read> src, Ptr<float> dst, uint chunk_idx, uint dim)
 {
-    EpilogueParams ep;
-    ep.bias = bias;
-    ep.x_scale = xs;
-    ep.w_scale = ws;
-    ep.has_bias = flags & 1u;
-    ep.has_x_scale = flags & 2u;
-    ep.has_w_scale = flags & 4u;
-    return ep;
+    uint base = chunk_idx << 2u;
+    if (base + 4u <= dim && is_ptr_aligned16(src) && is_ptr_aligned16(dst)) {
+        float4 v = load_a16(Ptr<float4, Access.Read>(src) + uint64_t(chunk_idx));
+        store_a16(Ptr<float4>(dst) + uint64_t(chunk_idx), v);
+    } else {
+        uint end = min(base + 4u, dim);
+        for (uint c = base; c < end; ++c) dst[c] = src[c];
+    }
+}
+
+public void zero_f32_chunk4(Ptr<float> dst, uint chunk_idx, uint dim) {
+    uint base = chunk_idx << 2u;
+    if (base + 4u <= dim && is_ptr_aligned16(dst)) {
+        store_a16(Ptr<float4>(dst) + uint64_t(chunk_idx), float4(0.0f));
+    } else {
+        uint end = min(base + 4u, dim);
+        for (uint c = base; c < end; ++c) dst[c] = 0.0f;
+    }
+}
+
+public void store_epilogue_f32x4<Ep : IEpilogue>(
+    Ptr<float> yr, uint row, uint col, uint m, bool y_aligned4,
+    float4 v, EpilogueParams ep)
+{
+    if (y_aligned4 && (col + 4u <= m)) {
+        float4 outv = float4(
+            Ep::apply(v.x, row, col + 0u, ep),
+            Ep::apply(v.y, row, col + 1u, ep),
+            Ep::apply(v.z, row, col + 2u, ep),
+            Ep::apply(v.w, row, col + 3u, ep));
+        store_a16(Ptr<float4>(yr + col), outv);
+    } else {
+        if (col + 0u < m) yr[col + 0u] = Ep::apply(v.x, row, col + 0u, ep);
+        if (col + 1u < m) yr[col + 1u] = Ep::apply(v.y, row, col + 1u, ep);
+        if (col + 2u < m) yr[col + 2u] = Ep::apply(v.z, row, col + 2u, ep);
+        if (col + 3u < m) yr[col + 3u] = Ep::apply(v.w, row, col + 3u, ep);
+    }
 }
 
 public interface IVecIO128<T : IElement> {
@@ -97,11 +149,6 @@ public float4 apply_act4<A : IActivation>(float4 v) {
     return float4(A::apply(v.x), A::apply(v.y), A::apply(v.z), A::apply(v.w));
 }
 
-public float4 apply_clamp4(float4 v, float lim) {
-    if (lim <= 0.0f) return v;
-    return clamp(v, float4(-lim), float4(lim));
-}
-
 public uint2 swizzle_tile_2d(uint3 gid, uint grid_x, uint grid_y) {
     uint linear = gid.y * grid_x + gid.x;
     uint tiles_per_grp = 8u * grid_x;
@@ -112,13 +159,14 @@ public uint2 swizzle_tile_2d(uint3 gid, uint grid_x, uint grid_y) {
     return uint2(rem / grp_h, first_y + (rem % grp_h));
 }
 
-public struct GemvArgs<TX : IElement, TW : IElement, TY : IElement> {
-    public Ptr<TX.Storage, Access.Read> x;
-    public Ptr<TW.Storage, Access.Read> w;
+// Unified 80-byte C-layout push-constant block shared by GEMV, F32 GEMM, and CoopMat GEMM.
+public struct LinearArgs<TXStorage, TWStorage, TYStorage> {
+    public Ptr<TXStorage, Access.Read> x;
+    public Ptr<TWStorage, Access.Read> w;
     public Ptr<float, Access.Read> bias;
     public Ptr<float, Access.Read> x_scale;
     public Ptr<float, Access.Read> w_scale;
-    public Ptr<TY.Storage> y;
+    public Ptr<TYStorage> y;
     public uint rows;
     public uint m;
     public uint k;

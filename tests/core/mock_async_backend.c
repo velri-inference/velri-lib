@@ -18,6 +18,7 @@ void velri_mock_async_reset_ctrl(void) {
     atomic_store(&g_ctrl.total_completed, 0U);
     atomic_store(&g_ctrl.total_uploads, 0U);
     atomic_store(&g_ctrl.total_downloads, 0U);
+    atomic_store(&g_ctrl.total_allocs, 0U);
 }
 
 typedef struct {
@@ -116,6 +117,7 @@ static velri_status mock_alloc(velri_backend_device *dev, size_t bytes, size_t a
     }
     memset(mb->bytes, 0, sz);
     mb->size = sz;
+    atomic_fetch_add(&g_ctrl.total_allocs, 1U);
     *out_mem_handle = mb;
     return VELRI_OK;
 }

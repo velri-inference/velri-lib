@@ -1,30 +1,16 @@
 // Vulkan Cooperative Matrix Shared-Memory GEMM (FP16, BF16, W8A8 x {128x128, 64x64}).
-// Requires 32-lane subgroups (gated on subgroup_size == 32 in vk_backend.c).
+// Requires 32-lane subgroups (gated on subgroup_size == 32 in vk_device.c).
 import numeric;
 import epilogue;
 import vk_common;
 
-struct CoopGemmArgs<TMat, TY> {
-    Ptr<TMat> x;
-    Ptr<TMat> w;
-    Ptr<float, Access.Read> bias;
-    Ptr<float, Access.Read> x_scale;
-    Ptr<float, Access.Read> w_scale;
-    Ptr<TY> y;
-    uint rows;
-    uint m;
-    uint k;
-    uint x_stride;
-    uint w_stride;
-    uint y_stride;
-    uint flags;
-    uint split_k;
-};
+// Padded shared-memory row stride in uint4 (4 active + 1 padding to eliminate bank conflicts).
+static const uint kCmSmemStrideU4 = 5u;
 
-groupshared uint4 s_cm128_a[128 * 5];
-groupshared uint4 s_cm128_b[128 * 5];
-groupshared uint4 s_cm64_a[64 * 5];
-groupshared uint4 s_cm64_b[64 * 5];
+groupshared uint4 s_cm128_a[128u * kCmSmemStrideU4];
+groupshared uint4 s_cm128_b[128u * kCmSmemStrideU4];
+groupshared uint4 s_cm64_a[64u * kCmSmemStrideU4];
+groupshared uint4 s_cm64_b[64u * kCmSmemStrideU4];
 
 uint4 load_u4_safe<let ELEM_BYTES : int>(
     Ptr<uint8_t, Access.Read> base_b, uint row, uint row_lim,
@@ -71,7 +57,7 @@ struct NAME : ICoopSmemTile<WGM, WGN, WM, WN> {                                 
     static linalg::CoopMat<T, MemoryScope.Subgroup, 16, K_STEP, linalg::CoopMatMatrixUse.MatrixA>  \
         loadMatA<T : ICoopElement, let K_STEP : int>(uint off_u4)                                  \
     {                                                                                              \
-        uint lay = 0u, str = 5u;                                                                   \
+        uint lay = 0u, str = kCmSmemStrideU4;                                                      \
         return spirv_asm {                                                                         \
             OpExtension "SPV_KHR_cooperative_matrix";                                              \
             OpCapability CooperativeMatrixKHR;                                                     \
@@ -85,7 +71,7 @@ struct NAME : ICoopSmemTile<WGM, WGN, WM, WN> {                                 
     static linalg::CoopMat<T, MemoryScope.Subgroup, K_STEP, 16, linalg::CoopMatMatrixUse.MatrixB>  \
         loadMatB<T : ICoopElement, let K_STEP : int>(uint off_u4)                                  \
     {                                                                                              \
-        uint lay = 1u, str = 5u;                                                                   \
+        uint lay = 1u, str = kCmSmemStrideU4;                                                      \
         return spirv_asm {                                                                         \
             OpExtension "SPV_KHR_cooperative_matrix";                                              \
             OpCapability CooperativeMatrixKHR;                                                     \
@@ -136,20 +122,32 @@ void write_staged_ep_tile<let IS_QUANT : int, Ep : IEpilogue,
         uint4 raw = S::readA(base_u4 + idx_u4);
         float4 fv = (IS_QUANT != 0) ? float4(int4(raw)) : asfloat(raw);
         Ptr<float> yr = y + uint64_t(gr) * uint64_t(y_stride);
-        if (y_aligned4 && (gc + 4u <= m)) {
-            float4 outv = float4(
-                Ep::apply(fv.x, gr, gc + 0u, ep),
-                Ep::apply(fv.y, gr, gc + 1u, ep),
-                Ep::apply(fv.z, gr, gc + 2u, ep),
-                Ep::apply(fv.w, gr, gc + 3u, ep));
-            store_a16(Ptr<float4>(yr + gc), outv);
-        } else {
-            if (gc + 0u < m) yr[gc + 0u] = Ep::apply(fv.x, gr, gc + 0u, ep);
-            if (gc + 1u < m) yr[gc + 1u] = Ep::apply(fv.y, gr, gc + 1u, ep);
-            if (gc + 2u < m) yr[gc + 2u] = Ep::apply(fv.z, gr, gc + 2u, ep);
-            if (gc + 3u < m) yr[gc + 3u] = Ep::apply(fv.w, gr, gc + 3u, ep);
-        }
+        store_epilogue_f32x4<Ep>(yr, gr, gc, m, y_aligned4, fv, ep);
     }
+}
+
+void coopmat_load_ab<TMat : ICoopElement, let K_STEP : int,
+                     let WG_M : int, let WG_N : int, let WARP_M : int, let WARP_N : int,
+                     S : ICoopSmemTile<WG_M, WG_N, WARP_M, WARP_N>>(
+    out linalg::CoopMat<TMat, MemoryScope.Subgroup, 16, K_STEP, linalg::CoopMatMatrixUse.MatrixA> mA[WARP_M],
+    out linalg::CoopMat<TMat, MemoryScope.Subgroup, K_STEP, 16, linalg::CoopMatMatrixUse.MatrixB> mB[WARP_N],
+    uint wr, uint wc, uint kk_u4)
+{
+    [ForceUnroll] for (uint i = 0u; i < uint(WARP_M); ++i)
+        mA[i] = S::loadMatA<TMat, K_STEP>((wr * uint(WARP_M * 16) + i * 16u) * kCmSmemStrideU4 + kk_u4);
+    [ForceUnroll] for (uint j = 0u; j < uint(WARP_N); ++j)
+        mB[j] = S::loadMatB<TMat, K_STEP>((wc * uint(WARP_N * 16) + j * 16u) * kCmSmemStrideU4 + kk_u4);
+}
+
+void coopmat_fma<TMat : ICoopElement, TAcc : ICoopElement, let K_STEP : int,
+                 let WARP_M : int, let WARP_N : int>(
+    inout linalg::CoopMat<TAcc, MemoryScope.Subgroup, 16, 16, linalg::CoopMatMatrixUse.MatrixAccumulator> acc[WARP_M][WARP_N],
+    linalg::CoopMat<TMat, MemoryScope.Subgroup, 16, K_STEP, linalg::CoopMatMatrixUse.MatrixA> mA[WARP_M],
+    linalg::CoopMat<TMat, MemoryScope.Subgroup, K_STEP, 16, linalg::CoopMatMatrixUse.MatrixB> mB[WARP_N])
+{
+    [ForceUnroll] for (uint i = 0u; i < uint(WARP_M); ++i)
+        [ForceUnroll] for (uint j = 0u; j < uint(WARP_N); ++j)
+            acc[i][j] = linalg::coopMatMulAdd<TAcc, false>(mA[i], mB[j], acc[i][j]);
 }
 
 void coopmat_mma_step<TMat : ICoopElement, TAcc : ICoopElement, let K_STEP : int,
@@ -160,13 +158,8 @@ void coopmat_mma_step<TMat : ICoopElement, TAcc : ICoopElement, let K_STEP : int
 {
     linalg::CoopMat<TMat, MemoryScope.Subgroup, 16, K_STEP, linalg::CoopMatMatrixUse.MatrixA> mA[WARP_M];
     linalg::CoopMat<TMat, MemoryScope.Subgroup, K_STEP, 16, linalg::CoopMatMatrixUse.MatrixB> mB[WARP_N];
-    [ForceUnroll] for (uint i = 0u; i < uint(WARP_M); ++i)
-        mA[i] = S::loadMatA<TMat, K_STEP>((wr * uint(WARP_M * 16) + i * 16u) * 5u + kk_u4);
-    [ForceUnroll] for (uint j = 0u; j < uint(WARP_N); ++j)
-        mB[j] = S::loadMatB<TMat, K_STEP>((wc * uint(WARP_N * 16) + j * 16u) * 5u + kk_u4);
-    [ForceUnroll] for (uint i = 0u; i < uint(WARP_M); ++i)
-        [ForceUnroll] for (uint j = 0u; j < uint(WARP_N); ++j)
-            acc[i][j] = linalg::coopMatMulAdd<TAcc, false>(mA[i], mB[j], acc[i][j]);
+    coopmat_load_ab<TMat, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(mA, mB, wr, wc, kk_u4);
+    coopmat_fma<TMat, TAcc, K_STEP, WARP_M, WARP_N>(acc, mA, mB);
 }
 
 void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
@@ -174,7 +167,7 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
                        let WG_M : int, let WG_N : int, let WARP_M : int, let WARP_N : int,
                        let NTHREADS : int,
                        S : ICoopSmemTile<WG_M, WG_N, WARP_M, WARP_N>>(
-    CoopGemmArgs<TMat, float> a, TAcc zero_acc, uint3 gtid, uint3 gid)
+    LinearArgs<TMat, TMat, float> a, TAcc zero_acc, uint3 gtid, uint3 gid)
 {
     uint tid = gtid.x;
     uint warp_id = tid >> 5u;
@@ -220,12 +213,12 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
         Ptr<uint4, Access.Read> wp0 = Ptr<uint4, Access.Read>(wb + w_off0);
         uint64_t x_step_u4 = (uint64_t(kRowStep) * uint64_t(a.x_stride)) / uint64_t(elems_per_u4);
         uint64_t w_step_u4 = (uint64_t(kRowStep) * uint64_t(a.w_stride)) / uint64_t(elems_per_u4);
-        uint s0 = lr0 * 5u + lu0;
+        uint s0 = lr0 * kCmSmemStrideU4 + lu0;
 
         [ForceUnroll] for (uint v = 0u; v < kVecA; ++v)
-            S::storeA(s0 + v * (kRowStep * 5u), load_a16(xp0 + uint64_t(v) * x_step_u4));
+            S::storeA(s0 + v * (kRowStep * kCmSmemStrideU4), load_a16(xp0 + uint64_t(v) * x_step_u4));
         [ForceUnroll] for (uint v = 0u; v < kVecB; ++v)
-            S::storeB(s0 + v * (kRowStep * 5u), load_a16(wp0 + uint64_t(v) * w_step_u4));
+            S::storeB(s0 + v * (kRowStep * kCmSmemStrideU4), load_a16(wp0 + uint64_t(v) * w_step_u4));
         GroupMemoryBarrierWithGroupSync();
 
         for (uint kt = 0u; kt < num_k_tiles; ++kt) {
@@ -244,20 +237,15 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
             coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, 0u);
             linalg::CoopMat<TMat, MemoryScope.Subgroup, 16, K_STEP, linalg::CoopMatMatrixUse.MatrixA> mA1[WARP_M];
             linalg::CoopMat<TMat, MemoryScope.Subgroup, K_STEP, 16, linalg::CoopMatMatrixUse.MatrixB> mB1[WARP_N];
-            [ForceUnroll] for (uint i = 0u; i < uint(WARP_M); ++i)
-                mA1[i] = S::loadMatA<TMat, K_STEP>((wr * uint(WARP_M * 16) + i * 16u) * 5u + 2u);
-            [ForceUnroll] for (uint j = 0u; j < uint(WARP_N); ++j)
-                mB1[j] = S::loadMatB<TMat, K_STEP>((wc * uint(WARP_N * 16) + j * 16u) * 5u + 2u);
+            coopmat_load_ab<TMat, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(mA1, mB1, wr, wc, 2u);
             if (has_next) {
                 GroupMemoryBarrierWithGroupSync();
                 [ForceUnroll] for (uint v = 0u; v < kVecA; ++v)
-                    S::storeA(s0 + v * (kRowStep * 5u), pA[v]);
+                    S::storeA(s0 + v * (kRowStep * kCmSmemStrideU4), pA[v]);
                 [ForceUnroll] for (uint v = 0u; v < kVecB; ++v)
-                    S::storeB(s0 + v * (kRowStep * 5u), pB[v]);
+                    S::storeB(s0 + v * (kRowStep * kCmSmemStrideU4), pB[v]);
             }
-            [ForceUnroll] for (uint i = 0u; i < uint(WARP_M); ++i)
-                [ForceUnroll] for (uint j = 0u; j < uint(WARP_N); ++j)
-                    acc[i][j] = linalg::coopMatMulAdd<TAcc, false>(mA1[i], mB1[j], acc[i][j]);
+            coopmat_fma<TMat, TAcc, K_STEP, WARP_M, WARP_N>(acc, mA1, mB1);
             if (has_next) {
                 GroupMemoryBarrierWithGroupSync();
             }
@@ -267,11 +255,13 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
             uint k0 = kt * bk_elems;
             [ForceUnroll] for (uint v = 0u; v < kVecA; ++v) {
                 uint lr = lr0 + v * kRowStep;
-                S::storeA(lr * 5u + lu0, load_u4_safe<ELEM_BYTES>(xb, row0 + lr, a.rows, k0 + lu0 * elems_per_u4, a.k, a.x_stride, aligned16));
+                S::storeA(lr * kCmSmemStrideU4 + lu0,
+                          load_u4_safe<ELEM_BYTES>(xb, row0 + lr, a.rows, k0 + lu0 * elems_per_u4, a.k, a.x_stride, aligned16));
             }
             [ForceUnroll] for (uint v = 0u; v < kVecB; ++v) {
                 uint lr = lr0 + v * kRowStep;
-                S::storeB(lr * 5u + lu0, load_u4_safe<ELEM_BYTES>(wb, col0 + lr, a.m, k0 + lu0 * elems_per_u4, a.k, a.w_stride, aligned16));
+                S::storeB(lr * kCmSmemStrideU4 + lu0,
+                          load_u4_safe<ELEM_BYTES>(wb, col0 + lr, a.m, k0 + lu0 * elems_per_u4, a.k, a.w_stride, aligned16));
             }
             GroupMemoryBarrierWithGroupSync();
             coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, 0u);
@@ -280,7 +270,7 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
         }
     }
 
-    EpilogueParams ep = make_vk_ep(a.bias, a.x_scale, a.w_scale, a.flags);
+    EpilogueParams ep = make_epilogue_params(a.bias, a.x_scale, a.w_scale, a.flags);
     bool y_aligned4 = is_ptr_aligned16(a.y) && ((a.y_stride & 3u) == 0u);
     if ((IS_QUANT == 0) && (a.flags == 0u) && y_aligned4 && (row0 + wg_m_u <= a.rows) && (col0 + wg_n_u <= a.m)) {
         [ForceUnroll] for (uint i = 0u; i < uint(WARP_M); ++i) {
@@ -311,31 +301,31 @@ void coopmat_gemm_smem<TMat : ICoopElement, TAcc : ICoopElement, Ep : IEpilogue,
 }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void vk_gemm_coopmat_f16(uniform CoopGemmArgs<half, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemm_coopmat_f16(uniform LinearArgs<half, half, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     coopmat_gemm_smem<half, float, EpBias, 16, 2, 0, 128, 128, 4, 2, 256, CoopSmem128>(a, 0.0f, gtid, gid);
 }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void vk_gemm_coopmat_bf16(uniform CoopGemmArgs<BFloat16, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemm_coopmat_bf16(uniform LinearArgs<BFloat16, BFloat16, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     coopmat_gemm_smem<BFloat16, float, EpBias, 16, 2, 0, 128, 128, 4, 2, 256, CoopSmem128>(a, 0.0f, gtid, gid);
 }
 
 [shader("compute")] [numthreads(256, 1, 1)]
-void vk_gemm_coopmat_w8a8(uniform CoopGemmArgs<int8_t, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemm_coopmat_w8a8(uniform LinearArgs<int8_t, int8_t, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     coopmat_gemm_smem<int8_t, int32_t, EpQuantScale, 32, 1, 1, 128, 128, 4, 2, 256, CoopSmem128>(a, 0, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
-void vk_gemm_coopmat_f16_64(uniform CoopGemmArgs<half, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemm_coopmat_f16_64(uniform LinearArgs<half, half, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     coopmat_gemm_smem<half, float, EpBias, 16, 2, 0, 64, 64, 2, 2, 128, CoopSmem64>(a, 0.0f, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
-void vk_gemm_coopmat_bf16_64(uniform CoopGemmArgs<BFloat16, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemm_coopmat_bf16_64(uniform LinearArgs<BFloat16, BFloat16, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     coopmat_gemm_smem<BFloat16, float, EpBias, 16, 2, 0, 64, 64, 2, 2, 128, CoopSmem64>(a, 0.0f, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
-void vk_gemm_coopmat_w8a8_64(uniform CoopGemmArgs<int8_t, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemm_coopmat_w8a8_64(uniform LinearArgs<int8_t, int8_t, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     coopmat_gemm_smem<int8_t, int32_t, EpQuantScale, 32, 1, 1, 64, 64, 2, 2, 128, CoopSmem64>(a, 0, gtid, gid);
 }

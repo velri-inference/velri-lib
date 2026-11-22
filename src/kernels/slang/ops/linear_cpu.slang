@@ -9,7 +9,10 @@ import epilogue;
 #ifndef VELRI_KC
 #define VELRI_KC 128
 #endif
+#define VELRI_MC 264
 static const uint kKC = uint(VELRI_KC);
+static const uint kMC = uint(VELRI_MC);
+static const uint kGemvRowThreshold = 4u;
 
 // ============================================================================
 // 1. Streaming GEMV (rows < 4): 4-col register blocking, zero packing overhead
@@ -319,7 +322,7 @@ public void linear_slice_cpu<let MR : int, let NR : int,
     EpilogueParams ep)
 {
     uint nrows = r1 - r0;
-    if (nrows < 4u) {
+    if (nrows < kGemvRowThreshold) {
         for (uint r = r0; r < r1; ++r) {
             Ptr<TX.Storage, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
             Ptr<TY.Storage> yr = y + uint64_t(r) * uint64_t(y_stride);
@@ -334,10 +337,9 @@ public void linear_slice_cpu<let MR : int, let NR : int,
         return;
     }
 
-    static const uint kMC = 264u;
     float4 bp4[VELRI_KC * (NR / 4)];
     float ap[MR * VELRI_KC];
-    float c_buf[264 * NR];
+    float c_buf[VELRI_MC * NR];
     bp4[0] = float4(0.0f); ap[0] = 0.0f; c_buf[0] = 0.0f;
     Ptr<float> bp = Ptr<float>(&bp4[0]);
     Ptr<float> ap_wr = &ap[0];
@@ -380,7 +382,7 @@ public void linear_w8a8_f32_slice_cpu<let MR : int, let NR : int>(
 {
     uint nrows = r1 - r0;
     uint64_t ws64 = uint64_t(w_stride);
-    if (nrows < 4u) {
+    if (nrows < kGemvRowThreshold) {
         for (uint r = r0; r < r1; ++r) {
             Ptr<int8_t, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
             Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
@@ -413,11 +415,10 @@ public void linear_w8a8_f32_slice_cpu<let MR : int, let NR : int>(
         return;
     }
 
-    static const uint kMC = 264u;
     float4 bp4[VELRI_KC * (NR / 4)];
     float ap[MR * VELRI_KC];
     float c_tmp[MR * NR];
-    uint32_t c_i32[264 * NR];
+    uint32_t c_i32[VELRI_MC * NR];
     bp4[0] = float4(0.0f); ap[0] = 0.0f; c_tmp[0] = 0.0f; c_i32[0] = 0u;
     Ptr<float> bp = Ptr<float>(&bp4[0]);
 
@@ -473,7 +474,7 @@ public void linear_f64_slice_cpu<let MR : int, let NR : int>(
 {
     uint nrows = r1 - r0;
     uint64_t ws64 = uint64_t(w_stride);
-    if (nrows < 4u) {
+    if (nrows < kGemvRowThreshold) {
         for (uint r = r0; r < r1; ++r) {
             Ptr<double, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
             Ptr<double> yr = y + uint64_t(r) * uint64_t(y_stride);
@@ -503,10 +504,9 @@ public void linear_f64_slice_cpu<let MR : int, let NR : int>(
         return;
     }
 
-    static const uint kMC = 264u;
     double4 bp4[VELRI_KC * (NR / 4)];
     double ap[MR * VELRI_KC];
-    double c_buf[264 * NR];
+    double c_buf[VELRI_MC * NR];
     bp4[0] = double4(0.0); ap[0] = 0.0; c_buf[0] = 0.0;
     Ptr<double> bp = Ptr<double>(&bp4[0]);
     Ptr<double> ap_wr = &ap[0];

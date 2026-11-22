@@ -50,6 +50,8 @@ Velri's composition invariants are expressed directly in Slang types with zero m
 - **Pipeline management:** AOT specialization selection and `VkPipeline` creation happen in `prepare`; on-disk pipeline cache compatibility is checked against device and driver identity.
 - **Portability to future GPU APIs:** the same `.slang` modules can compile to **Metal (MSL)**, **CUDA**, **DXIL**, and **WGSL** behind thin device backends in `src/backend/<name>/` without rewriting math.
 
+All production SPIR-V modules require `shaderInt64` for device-address arithmetic. Device enumeration checks this feature and device creation enables it. The Vulkan build emits Slang reflection for each production entry point. CMake uses it to generate the C push-constant structs and compile-time checks for size and every field offset. Decode, prefill, and Split-KV use the same partitioned online-softmax implementation for head dimensions up to 256. Split-KV stores unnormalized values and the partition statistics for its reduction shader.
+
 ---
 
 ## 4. CPU Path: Slang-First and Slang CPU Backend Improvement Plan

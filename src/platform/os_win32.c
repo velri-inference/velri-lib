@@ -17,14 +17,10 @@
 /* ---- Aligned Memory ---- */
 
 void *velri_os_aligned_alloc(size_t align, size_t bytes) {
-    size_t eff_align = align < sizeof(void *) ? sizeof(void *) : align;
-    if ((eff_align & (eff_align - 1U)) != 0U) {
+    size_t eff_align = 0U, sz = 0U;
+    if (!velri_os_aligned_size(align, bytes, &eff_align, &sz)) {
         return nullptr;
     }
-    if (bytes > SIZE_MAX - (eff_align - 1U)) {
-        return nullptr;
-    }
-    size_t sz = bytes ? ((bytes + eff_align - 1U) & ~(eff_align - 1U)) : eff_align;
     return _aligned_malloc(sz, eff_align);
 }
 
@@ -55,8 +51,17 @@ void velri_os_sleep_ms(uint32_t ms) {
 
 /* ---- Dynamic Shared Library Loading ---- */
 
-velri_os_lib *velri_os_dlopen_vulkan(void) {
-    return (velri_os_lib *)LoadLibraryA("vulkan-1.dll");
+velri_os_lib *velri_os_dlopen(const char *const *candidates) {
+    if (!candidates) {
+        return nullptr;
+    }
+    for (size_t i = 0U; candidates[i] != nullptr; ++i) {
+        HMODULE h = LoadLibraryA(candidates[i]);
+        if (h) {
+            return (velri_os_lib *)h;
+        }
+    }
+    return nullptr;
 }
 
 void *velri_os_dlsym(velri_os_lib *lib, const char *symbol) {
@@ -174,16 +179,56 @@ void velri_os_cond_wait(velri_os_cond *cv, velri_os_mutex *mtx) {
 
 void velri_os_cond_signal(velri_os_cond *cv) { WakeConditionVariable(&cv->handle); }
 
+void velri_os_cond_broadcast(velri_os_cond *cv) { WakeAllConditionVariable(&cv->handle); }
+
 /* ---- CPU Hints ---- */
 
 int velri_os_hardware_threads(void) {
     DWORD nproc = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    if (nproc == 0) {
+    if (nproc == 0U) {
         SYSTEM_INFO si;
         GetSystemInfo(&si);
         nproc = si.dwNumberOfProcessors;
     }
-    return (nproc > 0 && nproc < 65536) ? (int)nproc : 1;
+    return (nproc > 0U && nproc < 65536U) ? (int)nproc : 1;
+}
+
+uint32_t velri_os_available_physical_cores(void) {
+    /* The legacy affinity mask only describes a single processor group. */
+    USHORT num_groups = 1, group = 0;
+    DWORD_PTR allowed = 0, system_mask = 0;
+    HANDLE process = GetCurrentProcess();
+    if (!GetProcessGroupAffinity(process, &num_groups, &group) || num_groups != 1 ||
+        !GetProcessAffinityMask(process, &allowed, &system_mask)) {
+        return 0U;
+    }
+    DWORD bytes = 0U;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    if (bytes == 0U) {
+        return 0U;
+    }
+    unsigned char *buf = (unsigned char *)malloc(bytes);
+    if (!buf) {
+        return 0U;
+    }
+    uint32_t count = 0U;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &bytes)) {
+        for (DWORD offset = 0U; offset < bytes;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *entry =
+                (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + offset);
+            for (WORD i = 0; i < entry->Processor.GroupCount; ++i) {
+                const GROUP_AFFINITY *mask = &entry->Processor.GroupMask[i];
+                if (mask->Group == group && (mask->Mask & allowed) != 0) {
+                    ++count;
+                    break;
+                }
+            }
+            offset += entry->Size;
+        }
+    }
+    free(buf);
+    return count;
 }
 
 void velri_os_cpu_relax(void) { YieldProcessor(); }

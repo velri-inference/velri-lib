@@ -134,3 +134,62 @@ public struct ElemI8 : IElement {
         return float4(v);
     }
 }
+
+// ============================================================================
+// Shared Numeric Constants & Target-Agnostic Math Helpers (CPU + Vulkan)
+// ============================================================================
+
+// Finite -ffast-math safe negative-infinity sentinel and cutoff for softmax/attention.
+public static const float kNegInfSentinel = -3.4028234e38f;
+public static const float kNegInfCutoff = -3.4e38f;
+
+// Supported attention head-dimension tiers (fast partition-parallel vs. wide path).
+public static const uint kAttnFastHeadDim = 256u;
+public static const uint kAttnMaxHeadDim = 2048u;
+
+// Symmetric per-row INT8 quantization constants.
+public static const float kSymI8Eps = 1.0e-35f;
+public static const float kSymI8MinScale = 1.17549435e-38f;
+public static const float kSymI8MaxQ = 127.0f;
+
+// Compute symmetric per-row INT8 scale and safe reciprocal scale across normal,
+// tiny-positive (sub-1e-35 where 127/amax would overflow), and zero rows.
+public void compute_sym_i8_scale(float amax, out float scale, out float inv_scale) {
+    if (amax >= kSymI8Eps) {
+        scale = amax / kSymI8MaxQ;
+        inv_scale = kSymI8MaxQ / amax;
+    } else if (amax > 0.0f) {
+        scale = max(amax / kSymI8MaxQ, kSymI8MinScale);
+        inv_scale = 1.0f / scale;
+    } else {
+        scale = 1.0f;
+        inv_scale = 0.0f;
+    }
+}
+
+public int8_t quantize_sym_i8(float v, float inv_scale) {
+    float r = round(v * inv_scale);
+    float t = select(r < -kSymI8MaxQ, -kSymI8MaxQ, r);
+    float c = select(t > kSymI8MaxQ, kSymI8MaxQ, t);
+    return int8_t(int32_t(c));
+}
+
+// 4-point unnormalized Walsh-Hadamard transform (radix-4 Stockham butterfly).
+public float4 hadamard4(float4 v) {
+    float t0 = v.x + v.y;
+    float t1 = v.x - v.y;
+    float t2 = v.z + v.w;
+    float t3 = v.z - v.w;
+    return float4(t0 + t2, t1 + t3, t0 - t2, t1 - t3);
+}
+
+// 2D rotary complex multiplication used by both HALF and INTERLEAVED RoPE.
+public void rope_rotate_pair(float x0, float x1, float c, float s, out float y0, out float y1) {
+    y0 = x0 * c - x1 * s;
+    y1 = x1 * c + x0 * s;
+}
+
+public void rope_rotate_pair(float4 x0, float4 x1, float4 c, float4 s, out float4 y0, out float4 y1) {
+    y0 = x0 * c - x1 * s;
+    y1 = x1 * c + x0 * s;
+}

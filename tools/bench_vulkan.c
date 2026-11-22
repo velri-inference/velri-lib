@@ -57,8 +57,21 @@ typedef struct {
 
 /* Minimal standalone Vulkan timestamp runner for hardware ceiling calibration only. */
 static vk_ceilings measure_vk_ceilings(void) {
+    static const char *const k_vk_libs[] = {
+#if defined(_WIN32)
+        "vulkan-1.dll",
+#elif defined(__APPLE__)
+        "libvulkan.1.dylib",
+        "libvulkan.dylib",
+        "libMoltenVK.dylib",
+#else
+        "libvulkan.so.1",
+        "libvulkan.so",
+#endif
+        nullptr,
+    };
     vk_ceilings out = {0};
-    velri_os_lib *dl = velri_os_dlopen_vulkan();
+    velri_os_lib *dl = velri_os_dlopen(k_vk_libs);
     if (!dl) return out;
 
     PFN_vkGetInstanceProcAddr gipa = nullptr;

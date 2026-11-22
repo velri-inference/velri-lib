@@ -8,6 +8,10 @@
  * Caller thread participates as worker 0; background workers spin briefly for
  * back-to-back dispatches and park on condition variables when idle.
  */
+enum {
+    VELRI_POOL_MAX_WORKERS = 256
+};
+
 typedef struct velri_pool velri_pool;
 
 typedef void (*velri_parallel_fn)(void *ctx, size_t worker_id, size_t num_workers);

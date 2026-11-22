@@ -8,10 +8,10 @@ Documentation: **[English](docs/EN/architecture.md)** · **[Русский](docs
 
 ## What Works Today
 
-- **`VelriLib::velri`** (compatibility alias `VelriLib::core`, umbrella header `<velri_lib/velri_lib.h>`): single consolidated static library exposing 4 public C23 headers (`types.h`, `backend.h`, `graph.h`, `velri_lib.h`):
+- **`VelriLib::velri`** (compatibility alias `VelriLib::core`, umbrella header `<velri_lib/velri_lib.h>`): single consolidated static library with public C23 headers for types, backends, graphs and reusable blocks:
   - Core runtime: `Storage` / `TensorView` (zero-copy subviews), central operation validator, device-agnostic graph builder, liveness scratch arena packer, UMA-aware memory report, plan-level shared `WEIGHT` bindings (`velri_plan_bind_weight_host`), device-resident `STATE` with explicit host sync (`velri_slot_sync_state_{from,to}_host`), refcounted `ctx`/`plan` lifetimes, automatic `Device A -> RAM staging -> Device B` transfers with residence deduplication, and concurrent isolated `velri_slot` execution (`0 B` hot-path allocations).
   - Built-in CPU backend: 23 Slang AOT kernels (`entry_cpu.slang` compiled via `slangc` into target-neutral LLVM IR → Clang or native `.o` variants `base`, `avx2`, `avx512`, including FP64 linear) dispatched over persistent `velri_pool`.
-  - Built-in Vulkan backend (`-DVELRI_ENABLE_VULKAN=ON`): Vulkan 1.3 / SPIR-V 1.6 compute backend with 29 `spirv-val`-verified modular Slang shaders (`src/kernels/slang/vk/`), lazy pipeline creation, bounded chunked staging, and pre-allocated 8-slot async `VkFence` ring supporting multi-op `submit_batch`.
+  - Built-in Vulkan backend (`-DVELRI_ENABLE_VULKAN=ON`): Vulkan 1.3 / SPIR-V 1.6 compute backend with `spirv-val`-verified modular Slang shaders (`src/kernels/slang/vk/`), lazy pipeline creation, bounded chunked staging, and pre-allocated 8-slot async `VkFence` ring supporting multi-op `submit_batch`.
   - Verification: `test_kernels` (unified CPU ISAs + Vulkan correctness across all 12 ops + edge cases) and `test_core_contract`.
 - The earlier handwritten C23/SIMD CPU backend and deprecated `VelriLib::cpu_linear` target are archived on branch `archive/c23-cpu-legacy`. Public C headers are experimental and do not promise a stable binary ABI yet.
 
@@ -74,14 +74,14 @@ add_subdirectory(path/to/velri-lib velri-lib-build)
 target_link_libraries(my_application PRIVATE VelriLib::velri)
 ```
 
-Or from an installed package (`VelriLib 0.1.0 EXACT`):
+Or from an installed package (`VelriLib 0.2.0 EXACT`):
 
 ```sh
 cmake --install build --prefix /path/to/velri-lib-install
 ```
 
 ```cmake
-find_package(VelriLib 0.1.0 EXACT CONFIG REQUIRED)
+find_package(VelriLib 0.2.0 EXACT CONFIG REQUIRED)
 target_link_libraries(my_application PRIVATE VelriLib::velri)
 ```
 

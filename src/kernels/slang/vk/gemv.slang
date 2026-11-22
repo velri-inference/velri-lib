@@ -1,16 +1,16 @@
 // Vulkan High-Bandwidth GEMV kernels (F32, F16, BF16, W8A8 -> F32).
-// Reuses IVecIO128::unpack from vk_common (zero duplicated F16/BF16 unpackers).
+// Reuses IVecIO128::unpack and unified LinearArgs from vk_common.
 import numeric;
 import epilogue;
 import vk_common;
 
 void gemv_float_gpu_impl<T : IElement, VIO : IVecIO128<T>, Ep : IEpilogue>(
-    GemvArgs<T, T, ElemF32> a, uint3 gtid, uint3 gid)
+    LinearArgs<T.Storage, T.Storage, float> a, uint3 gtid, uint3 gid)
 {
     uint lane = WaveGetLaneIndex();
     uint lane_cnt = WaveGetLaneCount();
     uint warp_in_wg = gtid.x / lane_cnt;
-    uint warps_per_wg = 128u / lane_cnt;
+    uint warps_per_wg = kGemvWgSize / lane_cnt;
     uint col = gid.x * warps_per_wg + warp_in_wg;
     uint row = gid.y;
     if (row >= a.rows || col >= a.m) return;
@@ -42,31 +42,31 @@ void gemv_float_gpu_impl<T : IElement, VIO : IVecIO128<T>, Ep : IEpilogue>(
     float total = WaveActiveSum(acc);
     if (lane == 0u) {
         a.y[uint64_t(row) * uint64_t(a.y_stride) + uint64_t(col)] =
-            Ep::apply(total, row, col, make_vk_ep(a.bias, a.x_scale, a.w_scale, a.flags));
+            Ep::apply(total, row, col, make_epilogue_params(a.bias, a.x_scale, a.w_scale, a.flags));
     }
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
-void vk_gemv_f32(uniform GemvArgs<ElemF32, ElemF32, ElemF32> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemv_f32(uniform LinearArgs<float, float, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     gemv_float_gpu_impl<ElemF32, VecIOF32, EpBias>(a, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
-void vk_gemv_f16(uniform GemvArgs<ElemF16, ElemF16, ElemF32> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemv_f16(uniform LinearArgs<ElemF16.Storage, ElemF16.Storage, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     gemv_float_gpu_impl<ElemF16, VecIOF16, EpBias>(a, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
-void vk_gemv_bf16(uniform GemvArgs<ElemBF16, ElemBF16, ElemF32> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemv_bf16(uniform LinearArgs<ElemBF16.Storage, ElemBF16.Storage, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     gemv_float_gpu_impl<ElemBF16, VecIOBF16, EpBias>(a, gtid, gid);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
-void vk_gemv_w8a8(uniform GemvArgs<ElemI8, ElemI8, ElemF32> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+void vk_gemv_w8a8(uniform LinearArgs<int8_t, int8_t, float> a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint lane = WaveGetLaneIndex();
     uint lane_cnt = WaveGetLaneCount();
     uint warp_in_wg = gtid.x / lane_cnt;
-    uint warps_per_wg = 128u / lane_cnt;
+    uint warps_per_wg = kGemvWgSize / lane_cnt;
     uint col = gid.x * warps_per_wg + warp_in_wg;
     uint row = gid.y;
     if (row >= a.rows || col >= a.m) return;
@@ -98,6 +98,6 @@ void vk_gemv_w8a8(uniform GemvArgs<ElemI8, ElemI8, ElemF32> a, uint3 gtid : SV_G
     int32_t total = WaveActiveSum(acc);
     if (lane == 0u) {
         a.y[uint64_t(row) * uint64_t(a.y_stride) + uint64_t(col)] =
-            EpQuantScale::apply(float(total), row, col, make_vk_ep(a.bias, a.x_scale, a.w_scale, a.flags));
+            EpQuantScale::apply(float(total), row, col, make_epilogue_params(a.bias, a.x_scale, a.w_scale, a.flags));
     }
 }

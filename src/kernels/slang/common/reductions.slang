@@ -6,60 +6,59 @@ module reductions;
 static const uint kMaxSubgroups = 64u;
 groupshared float g_reduce_buf[kMaxSubgroups];
 
-public float wg_reduce_sum(float val, uint tid, uint wg_size) {
-    float wave_sum = WaveActiveSum(val);
+public interface IReduceOp {
+    static float identity();
+    static float combine(float a, float b);
+    static float waveReduce(float v);
+}
+
+public struct ReduceAdd : IReduceOp {
+    public static float identity() { return 0.0f; }
+    public static float combine(float a, float b) { return a + b; }
+    public static float waveReduce(float v) { return WaveActiveSum(v); }
+}
+
+public struct ReduceMax : IReduceOp {
+    public static float identity() { return asfloat(0xFF800000u); } // -INF
+    public static float combine(float a, float b) { return max(a, b); }
+    public static float waveReduce(float v) { return WaveActiveMax(v); }
+}
+
+public float wg_reduce<Op : IReduceOp>(float val, uint tid, uint wg_size) {
+    float wave_val = Op::waveReduce(val);
     uint lane_count = WaveGetLaneCount();
     uint lane_id = WaveGetLaneIndex();
     uint wave_id = tid / lane_count;
     uint num_waves = (wg_size + lane_count - 1u) / lane_count;
 
     if (num_waves <= 1u) {
-        return wave_sum;
+        return wave_val;
     }
     if (lane_id == 0u) {
-        g_reduce_buf[wave_id] = wave_sum;
+        g_reduce_buf[wave_id] = wave_val;
     }
     GroupMemoryBarrierWithGroupSync();
 
     if (wave_id == 0u) {
-        float acc = 0.0f;
+        float acc = Op::identity();
         for (uint i = lane_id; i < num_waves; i += lane_count) {
-            acc += g_reduce_buf[i];
+            acc = Op::combine(acc, g_reduce_buf[i]);
         }
-        float total = WaveActiveSum(acc);
+        float total = Op::waveReduce(acc);
         if (lane_id == 0u) {
             g_reduce_buf[0] = total;
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    return g_reduce_buf[0];
+    float res = g_reduce_buf[0];
+    GroupMemoryBarrierWithGroupSync();
+    return res;
+}
+
+public float wg_reduce_sum(float val, uint tid, uint wg_size) {
+    return wg_reduce<ReduceAdd>(val, tid, wg_size);
 }
 
 public float wg_reduce_max(float val, uint tid, uint wg_size) {
-    float wave_max = WaveActiveMax(val);
-    uint lane_count = WaveGetLaneCount();
-    uint lane_id = WaveGetLaneIndex();
-    uint wave_id = tid / lane_count;
-    uint num_waves = (wg_size + lane_count - 1u) / lane_count;
-
-    if (num_waves <= 1u) {
-        return wave_max;
-    }
-    if (lane_id == 0u) {
-        g_reduce_buf[wave_id] = wave_max;
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    if (wave_id == 0u) {
-        float acc = asfloat(0xFF800000u); // -INF
-        for (uint i = lane_id; i < num_waves; i += lane_count) {
-            acc = max(acc, g_reduce_buf[i]);
-        }
-        float total = WaveActiveMax(acc);
-        if (lane_id == 0u) {
-            g_reduce_buf[0] = total;
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-    return g_reduce_buf[0];
+    return wg_reduce<ReduceMax>(val, tid, wg_size);
 }

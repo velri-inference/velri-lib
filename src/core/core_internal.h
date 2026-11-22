@@ -1,73 +1,72 @@
 #ifndef VELRI_CORE_INTERNAL_H
 #define VELRI_CORE_INTERNAL_H
 
+#include "ops_internal.h"
 #include "os.h"
-#include "velri_lib/backend.h"
+#include "util_internal.h"
 #include "velri_lib/graph.h"
-#include <stdlib.h>
+
+/*
+ * Core Runtime, Graph, Plan, and Slot Internal Data Structures.
+ * (Generic math/vector helpers live in `util_internal.h`; op metadata lives in `ops_internal.h`.)
+ */
 
 enum {
     VELRI_MAX_DEVICES = VELRI_MAX_REPORT_DEVICES,
     VELRI_MAX_BACKENDS = 16,
-    VELRI_MAX_SUBMIT_BATCH = 32
+    VELRI_MAX_WEIGHT_SLABS = 64
 };
 
-static inline bool velri_mul_overflow_size(size_t a, size_t b, size_t *out) {
-    if (a != 0U && b > SIZE_MAX / a) {
-        return true;
-    }
-    *out = a * b;
-    return false;
+/* Pack non-host weights into slabs up to 512 MiB each (avoids per-tensor Vulkan allocations). */
+#define VELRI_WEIGHT_SLAB_LIMIT ((size_t)512U * 1024U * 1024U)
+
+typedef enum {
+    VELRI_ARENA_NONE = 0,
+    VELRI_ARENA_SCRATCH = 1,
+    VELRI_ARENA_WEIGHT = 2,
+    VELRI_ARENA_STATE = 3,
+    VELRI_ARENA_IO = 4
+} velri_arena_kind;
+
+typedef enum {
+    VELRI_SLOT_ARENA_SCRATCH = 0,
+    VELRI_SLOT_ARENA_STATE = 1,
+    VELRI_SLOT_ARENA_IO = 2,
+    VELRI_SLOT_ARENA_COUNT = 3
+} velri_slot_arena_id;
+
+/* ---- Buffer Binding Pointer Helpers (shared by executor & CPU backend) ---- */
+
+static inline void *velri_binding_ptr(const velri_buffer_binding *b) {
+    return (void *)((uint8_t *)b->mem_handle + b->byte_offset);
 }
 
-static inline bool velri_add_overflow_size(size_t a, size_t b, size_t *out) {
-    if (a > SIZE_MAX - b) {
-        return true;
-    }
-    *out = a + b;
-    return false;
+static inline const void *velri_binding_cptr(const velri_buffer_binding *b) {
+    return (const void *)((const uint8_t *)b->mem_handle + b->byte_offset);
 }
 
-static inline size_t velri_align_up(size_t n, size_t align) {
-    if (align <= 1U) {
-        return n;
-    }
-    size_t mask = align - 1U;
-    if (n > SIZE_MAX - mask) {
-        return SIZE_MAX;
-    }
-    return (n + mask) & ~mask;
+static inline bool velri_binding_range_valid(const velri_buffer_binding *b, size_t bytes) {
+    return b && b->mem_handle && b->byte_offset <= b->byte_size &&
+           bytes <= b->byte_size - b->byte_offset;
 }
 
-static inline bool velri_vec_grow(void **ptr, uint32_t *cap, uint32_t need, size_t elem_size) {
-    if (need <= *cap) {
-        return true;
-    }
-    uint32_t next = (*cap == 0U) ? 16U : *cap;
-    while (next < need) {
-        if (next > UINT32_MAX / 2U) {
-            return false;
-        }
-        next *= 2U;
-    }
-    size_t bytes = 0U;
-    if (velri_mul_overflow_size((size_t)next, elem_size, &bytes)) {
-        return false;
-    }
-    void *p = realloc(*ptr, bytes);
-    if (!p) {
-        return false;
-    }
-    *ptr = p;
-    *cap = next;
-    return true;
-}
+/* ---- Internal Tensor-View Predicates (implemented in `src/core/tensor.c`) ---- */
+
+bool velri_tensor_view_overlaps(const velri_tensor_view *a, const velri_tensor_view *b);
+bool velri_tensor_view_identical_layout(const velri_tensor_view *a, const velri_tensor_view *b);
+bool velri_tensor_view_no_partial_overlap(const velri_tensor_view *in,
+                                          const velri_tensor_view *out);
+bool velri_tensor_view_covers_storage(const velri_tensor_view *v, size_t storage_bytes);
+velri_status velri_shape_byte_size(velri_dtype dtype, uint32_t rank, const size_t *dims,
+                                   size_t *out_bytes);
 
 /* ---- Context & Registered Backends ---- */
 
 typedef struct {
     size_t workers;
     velri_cpu_variant variant;
+    bool use_physical_cores;
+    uint32_t reserve_cores;
 } velri_cpu_open_cfg;
 
 typedef struct {
@@ -128,34 +127,35 @@ typedef struct {
     velri_device_id device_id;
     size_t byte_size;
     size_t align;
-    bool in_scratch_arena; /* True => lives inside per-device packed scratch arena */
-    size_t arena_offset;   /* Offset inside that device's scratch arena */
+    velri_arena_kind arena_kind; /* Arena owning this storage's device memory (if any) */
+    uint32_t slab_idx;           /* For VELRI_ARENA_WEIGHT: index in plan->weight_slabs[dev] */
+    size_t arena_offset;         /* Byte offset inside the owning arena/slab */
 } velri_plan_storage;
 
 typedef struct {
     const void *host_ptr;
     size_t bound_bytes;
-    void *device_handle; /* Allocated once per plan for non-host WEIGHT storages */
     bool is_bound;
 } velri_plan_weight_binding;
 
+/* Set on the first OP step of each submission. Transfer steps stand alone. */
 typedef struct {
-    uint32_t plan_storage_idx;
-    size_t view_byte_offset;
-    bool present;
-} velri_step_arg;
+    uint32_t count;
+    uint32_t capture_index; /* Index in each slot's capture array on backends supporting replay */
+    bool static_t1;
+} velri_launch_batch;
 
 typedef struct {
     velri_launch_step_kind kind;
     union {
         struct {
             velri_device_id device_id;
-            velri_resolved_op resolved;
+            velri_resolved_op resolved;  /* Authoritative num_inputs/outputs, present, byte_offset */
             velri_prepared_op *prepared; /* Optional backend handle (may be nullptr) */
-            uint32_t num_inputs;
-            uint32_t num_outputs;
-            velri_step_arg inputs[VELRI_OP_MAX_INPUTS];
-            velri_step_arg outputs[VELRI_OP_MAX_OUTPUTS];
+            uint32_t in_storage_idx[VELRI_OP_MAX_INPUTS];
+            uint32_t out_storage_idx[VELRI_OP_MAX_OUTPUTS];
+            velri_launch_batch batch;
+            bool no_barrier_before; /* True => DAG analysis proved no RAW/WAR/WAW hazard in batch */
         } op;
         struct {
             velri_device_id src_device_id;
@@ -175,22 +175,30 @@ struct velri_plan {
     uint32_t num_storages;
 
     velri_plan_weight_binding *weight_bindings; /* Shared immutable WEIGHT bindings [num_user_storages] */
+    velri_plan *weight_owner;                   /* Optional retained peer plan owning WEIGHT slabs/bindings */
+    uint32_t *weight_peer_sid;                  /* [num_user_storages] -> owner storage_id when borrowed */
 
-    size_t scratch_arena_bytes[VELRI_MAX_DEVICES];
-    size_t scratch_arena_align[VELRI_MAX_DEVICES];
+    void *weight_slabs[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
+    size_t weight_slab_bytes[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
+    size_t weight_slab_align[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
+    uint32_t num_weight_slabs[VELRI_MAX_DEVICES];
+
+    size_t slot_arena_bytes[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];
+    size_t slot_arena_align[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];
     size_t ram_staging_bytes;
 
     velri_launch_step *steps;
     uint32_t num_steps;
+    uint32_t max_batch_len;       /* Max consecutive same-device OP steps (for 0-alloc batching) */
+    uint32_t num_capture_batches; /* Batches on backends supporting capture/replay */
+    uint32_t dag_total_ops;       /* Total VELRI_STEP_OP steps in plan */
+    uint32_t dag_elided_barriers; /* Intra-batch barriers elided by DAG hazard analysis */
 
     velri_memory_report report;
 };
 
 void velri_plan_retain(velri_plan *plan);
 void velri_plan_release(velri_plan *plan);
-
-/* Central operation registry validator (src/ops/registry.c). */
-velri_status velri_op_validate(const velri_resolved_op *op);
 
 #ifdef VELRI_CORE_HAS_VULKAN
 const velri_backend_vtable *velri_vulkan_backend_vtable(void);

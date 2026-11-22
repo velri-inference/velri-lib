@@ -56,7 +56,17 @@ public struct ActReLU2 : IActivation {
 
 public float apply_symmetric_clamp(float x, float limit) {
     if (limit > 0.0f) {
-        return clamp(x, -limit, limit);
+        return fast_clampf(x, -limit, limit);
     }
     return x;
+}
+
+public float4 apply_symmetric_clamp4(float4 v, float lim) {
+    if (lim > 0.0f) {
+        float4 lo = float4(-lim);
+        float4 hi = float4(lim);
+        float4 t = select(v < lo, lo, v);
+        return select(t > hi, hi, t);
+    }
+    return v;
 }

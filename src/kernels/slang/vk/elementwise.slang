@@ -49,8 +49,8 @@ void gated_mlp_gpu_impl<A : IActivation>(GatedMlpArgs a, uint tid) {
     uint base = tid << 2u;
     if (base + 4u <= a.count && is_ptr_aligned16(a.gate) &&
         is_ptr_aligned16(a.up) && is_ptr_aligned16(a.y)) {
-        float4 g = apply_clamp4(load_a16(Ptr<float4, Access.Read>(a.gate) + tid), a.clamp_limit);
-        float4 u = apply_clamp4(load_a16(Ptr<float4, Access.Read>(a.up) + tid), a.clamp_limit);
+        float4 g = apply_symmetric_clamp4(load_a16(Ptr<float4, Access.Read>(a.gate) + tid), a.clamp_limit);
+        float4 u = apply_symmetric_clamp4(load_a16(Ptr<float4, Access.Read>(a.up) + tid), a.clamp_limit);
         store_a16(Ptr<float4>(a.y) + tid, apply_act4<A>(g) * u);
     } else {
         uint end = min(base + 4u, a.count);
@@ -140,29 +140,27 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
     if (row >= a.rows) return;
     Ptr<float, Access.Read> xr = a.x + uint64_t(row) * uint64_t(a.x_stride);
     Ptr<float> yr = a.y + uint64_t(row) * uint64_t(a.y_stride);
-    static const float kNegInfInit = -3.4028234e38f;
-    static const float kNegInfCutoff = -3.4e38f;
 
     bool aligned = ((a.cols & 3u) == 0u) && is_ptr_aligned16(xr) && is_ptr_aligned16(yr);
-    if (aligned && a.cols <= 4096u) {
+    if (aligned && a.cols <= kRowRegCacheMaxDim) {
         uint n4 = a.cols >> 2u;
         Ptr<float4, Access.Read> xr4 = Ptr<float4, Access.Read>(xr);
         Ptr<float4> yr4 = Ptr<float4>(yr);
 
         float4 reg[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
-        float local_max = kNegInfInit;
+        float local_max = kNegInfSentinel;
         [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
-            uint idx = s * 256u + tid;
+            uint idx = s * kRowWgSize + tid;
             if (idx < n4) {
                 float4 v = load_a16(xr4 + idx);
                 reg[s] = v;
                 local_max = max(local_max, max(max(v.x, v.y), max(v.z, v.w)));
             }
         }
-        float row_max = wg_reduce_max(local_max, tid, 256u);
+        float row_max = wg_reduce_max(local_max, tid, kRowWgSize);
         if (!(row_max > kNegInfCutoff)) {
             [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
-                uint idx = s * 256u + tid;
+                uint idx = s * kRowWgSize + tid;
                 if (idx < n4) store_a16(yr4 + idx, float4(0.0f));
             }
             return;
@@ -170,7 +168,7 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
 
         float local_sum = 0.0f;
         [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
-            uint idx = s * 256u + tid;
+            uint idx = s * kRowWgSize + tid;
             if (idx < n4) {
                 float4 v = reg[s];
                 float4 e = float4(
@@ -182,36 +180,36 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
                 local_sum += e.x + e.y + e.z + e.w;
             }
         }
-        float total_sum = wg_reduce_sum(local_sum, tid, 256u);
+        float total_sum = wg_reduce_sum(local_sum, tid, kRowWgSize);
         float inv_sum = (total_sum > 0.0f) ? (1.0f / total_sum) : 0.0f;
 
         [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
-            uint idx = s * 256u + tid;
+            uint idx = s * kRowWgSize + tid;
             if (idx < n4) store_a16(yr4 + idx, reg[s] * inv_sum);
         }
         return;
     }
 
-    float local_max = kNegInfInit;
-    for (uint c = tid; c < a.cols; c += 256u) {
+    float local_max = kNegInfSentinel;
+    for (uint c = tid; c < a.cols; c += kRowWgSize) {
         local_max = max(local_max, xr[c]);
     }
-    float row_max = wg_reduce_max(local_max, tid, 256u);
+    float row_max = wg_reduce_max(local_max, tid, kRowWgSize);
     if (!(row_max > kNegInfCutoff)) {
-        for (uint c = tid; c < a.cols; c += 256u) yr[c] = 0.0f;
+        for (uint c = tid; c < a.cols; c += kRowWgSize) yr[c] = 0.0f;
         return;
     }
 
     float local_sum = 0.0f;
-    for (uint c = tid; c < a.cols; c += 256u) {
+    for (uint c = tid; c < a.cols; c += kRowWgSize) {
         float v = xr[c];
         float e = (v > kNegInfCutoff) ? fast_expf(v - row_max) : 0.0f;
         yr[c] = e;
         local_sum += e;
     }
-    float total_sum = wg_reduce_sum(local_sum, tid, 256u);
+    float total_sum = wg_reduce_sum(local_sum, tid, kRowWgSize);
     float inv_sum = (total_sum > 0.0f) ? (1.0f / total_sum) : 0.0f;
-    for (uint c = tid; c < a.cols; c += 256u) {
+    for (uint c = tid; c < a.cols; c += kRowWgSize) {
         yr[c] *= inv_sum;
     }
 }
@@ -233,7 +231,7 @@ struct FwhtArgs {
     uint pad;
 };
 
-groupshared float4 s_fwht[256];
+groupshared float4 s_fwht[kRowWgSize];
 
 float4 fwht_stage(float4 v, uint tid, uint lane, uint lane_cnt, uint bit) {
     if (bit < lane_cnt) {
@@ -252,30 +250,22 @@ void vk_fwht_f32(uniform FwhtArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : 
     uint row = gid.y;
     uint tid = gtid.x;
     if (row >= a.rows) return;
-    uint elem0 = gid.x * 1024u + tid * 4u;
+    uint elem0 = gid.x * (kRowWgSize * 4u) + tid * 4u;
     Ptr<float, Access.Read> xr = a.x + uint64_t(row) * uint64_t(a.x_stride);
     Ptr<float> yr = a.y + uint64_t(row) * uint64_t(a.y_stride);
 
     float4 v = float4(0.0f);
     bool active = (elem0 < a.cols);
     if (active) {
-        if (is_ptr_aligned16(xr)) {
-            v = load_a16(Ptr<float4, Access.Read>(xr + elem0));
-        } else {
-            v = float4(xr[elem0 + 0u], xr[elem0 + 1u], xr[elem0 + 2u], xr[elem0 + 3u]);
-        }
+        v = load_f32x4_maybe_a16(xr + elem0);
         if (a.suh_mode == 1u) {
             Ptr<float, Access.Read> sf = Ptr<float, Access.Read>(a.suh);
-            float4 sv = is_ptr_aligned16(sf) ? load_a16(Ptr<float4, Access.Read>(sf + elem0))
-                                             : float4(sf[elem0], sf[elem0 + 1u], sf[elem0 + 2u], sf[elem0 + 3u]);
-            v *= sv;
+            v *= load_f32x4_maybe_a16(sf + elem0);
         } else if (a.suh_mode == 2u) {
             Ptr<half, Access.Read> sh = Ptr<half, Access.Read>(a.suh);
             v *= float4(float(sh[elem0]), float(sh[elem0 + 1u]), float(sh[elem0 + 2u]), float(sh[elem0 + 3u]));
         }
-        float a0 = v.x + v.y, a1 = v.x - v.y;
-        float a2 = v.z + v.w, a3 = v.z - v.w;
-        v = float4(a0 + a2, a1 + a3, a0 - a2, a1 - a3);
+        v = hadamard4(v);
     }
 
     uint lane = WaveGetLaneIndex();
@@ -288,13 +278,7 @@ void vk_fwht_f32(uniform FwhtArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : 
     if (a.block_size >= 256u) v = fwht_stage(v, tid, lane, lane_cnt, 32u);
 
     if (active) {
-        v *= a.inv_sqrt_b;
-        if (is_ptr_aligned16(yr)) {
-            store_a16(Ptr<float4>(yr + elem0), v);
-        } else {
-            yr[elem0 + 0u] = v.x; yr[elem0 + 1u] = v.y;
-            yr[elem0 + 2u] = v.z; yr[elem0 + 3u] = v.w;
-        }
+        store_f32x4_maybe_a16(yr + elem0, v * a.inv_sqrt_b);
     }
 }
 
@@ -312,7 +296,7 @@ struct QuantizeRowArgs {
 };
 
 uint pack_i8x4_scaled(float4 scaled) {
-    float4 s = clamp(round(scaled), float4(-127.0f), float4(127.0f));
+    float4 s = clamp(round(scaled), float4(-kSymI8MaxQ), float4(kSymI8MaxQ));
     uint b0 = uint(int32_t(s.x)) & 0xFFu;
     uint b1 = uint(int32_t(s.y)) & 0xFFu;
     uint b2 = uint(int32_t(s.z)) & 0xFFu;
@@ -329,7 +313,7 @@ void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThre
     Ptr<int8_t> qr = a.x_i8 + uint64_t(row) * uint64_t(a.xi8_stride);
 
     bool aligned = ((a.k & 3u) == 0u) && is_ptr_aligned16(xr) && is_ptr_aligned4(qr);
-    if (aligned && a.k <= 4096u) {
+    if (aligned && a.k <= kRowRegCacheMaxDim) {
         uint n4 = a.k >> 2u;
         Ptr<float4, Access.Read> xr4 = Ptr<float4, Access.Read>(xr);
         Ptr<uint> qr4 = Ptr<uint>(qr);
@@ -337,7 +321,7 @@ void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThre
         float4 reg[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
         float local_max = 0.0f;
         [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
-            uint idx = s * 256u + tid;
+            uint idx = s * kRowWgSize + tid;
             if (idx < n4) {
                 float4 v = load_a16(xr4 + idx);
                 reg[s] = v;
@@ -345,52 +329,35 @@ void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThre
                 local_max = max(local_max, max(max(av.x, av.y), max(av.z, av.w)));
             }
         }
-        float amax = wg_reduce_max(local_max, tid, 256u);
-        if (amax >= 1.0e-35f) {
-            float scale = amax / 127.0f;
-            float inv_scale = 127.0f / amax;
-            if (tid == 0u) a.scale_out[row] = scale;
+        float amax = wg_reduce_max(local_max, tid, kRowWgSize);
+        float scale, inv_scale;
+        compute_sym_i8_scale(amax, scale, inv_scale);
+        if (tid == 0u) a.scale_out[row] = scale;
+        if (inv_scale == 0.0f) {
             [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
-                uint idx = s * 256u + tid;
-                if (idx < n4) qr4[idx] = pack_i8x4_scaled(reg[s] * inv_scale);
-            }
-        } else if (amax > 0.0f) {
-            float scale = max(amax / 127.0f, 1.17549435e-38f);
-            if (tid == 0u) a.scale_out[row] = scale;
-            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
-                uint idx = s * 256u + tid;
-                if (idx < n4) qr4[idx] = pack_i8x4_scaled(reg[s] / scale);
+                uint idx = s * kRowWgSize + tid;
+                if (idx < n4) qr4[idx] = 0u;
             }
         } else {
-            if (tid == 0u) a.scale_out[row] = 1.0f;
             [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
-                uint idx = s * 256u + tid;
-                if (idx < n4) qr4[idx] = 0u;
+                uint idx = s * kRowWgSize + tid;
+                if (idx < n4) qr4[idx] = pack_i8x4_scaled(reg[s] * inv_scale);
             }
         }
         return;
     }
 
     float local_max = 0.0f;
-    for (uint c = tid; c < a.k; c += 256u) {
+    for (uint c = tid; c < a.k; c += kRowWgSize) {
         local_max = max(local_max, abs(xr[c]));
     }
-    float amax = wg_reduce_max(local_max, tid, 256u);
-    if (amax >= 1.0e-35f) {
-        float scale = amax / 127.0f;
-        float inv_scale = 127.0f / amax;
-        if (tid == 0u) a.scale_out[row] = scale;
-        for (uint c = tid; c < a.k; c += 256u) {
-            qr[c] = int8_t(int32_t(clamp(round(xr[c] * inv_scale), -127.0f, 127.0f)));
-        }
-    } else if (amax > 0.0f) {
-        float scale = max(amax / 127.0f, 1.17549435e-38f);
-        if (tid == 0u) a.scale_out[row] = scale;
-        for (uint c = tid; c < a.k; c += 256u) {
-            qr[c] = int8_t(int32_t(clamp(round(xr[c] / scale), -127.0f, 127.0f)));
-        }
+    float amax = wg_reduce_max(local_max, tid, kRowWgSize);
+    float scale, inv_scale;
+    compute_sym_i8_scale(amax, scale, inv_scale);
+    if (tid == 0u) a.scale_out[row] = scale;
+    if (inv_scale == 0.0f) {
+        for (uint c = tid; c < a.k; c += kRowWgSize) qr[c] = int8_t(0);
     } else {
-        if (tid == 0u) a.scale_out[row] = 1.0f;
-        for (uint c = tid; c < a.k; c += 256u) qr[c] = int8_t(0);
+        for (uint c = tid; c < a.k; c += kRowWgSize) qr[c] = quantize_sym_i8(xr[c], inv_scale);
     }
 }

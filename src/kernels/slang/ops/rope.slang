@@ -16,22 +16,20 @@ public void rope_apply_head<T : IElement>(
     uint half_rot = rotary_dim >> 1u;
     if (mode == 0u) {
         for (uint i = 0u; i < half_rot; ++i) {
-            float x0 = T::toF32(xh[i]);
-            float x1 = T::toF32(xh[i + half_rot]);
-            float c = cos_row[i];
-            float s = sin_row[i];
-            yh[i] = T::fromF32(x0 * c - x1 * s);
-            yh[i + half_rot] = T::fromF32(x1 * c + x0 * s);
+            float y0, y1;
+            rope_rotate_pair(T::toF32(xh[i]), T::toF32(xh[i + half_rot]),
+                             cos_row[i], sin_row[i], y0, y1);
+            yh[i] = T::fromF32(y0);
+            yh[i + half_rot] = T::fromF32(y1);
         }
     } else {
         for (uint i = 0u; i < half_rot; ++i) {
             uint idx = i << 1u;
-            float x0 = T::toF32(xh[idx]);
-            float x1 = T::toF32(xh[idx + 1u]);
-            float c = cos_row[i];
-            float s = sin_row[i];
-            yh[idx] = T::fromF32(x0 * c - x1 * s);
-            yh[idx + 1u] = T::fromF32(x1 * c + x0 * s);
+            float y0, y1;
+            rope_rotate_pair(T::toF32(xh[idx]), T::toF32(xh[idx + 1u]),
+                             cos_row[i], sin_row[i], y0, y1);
+            yh[idx] = T::fromF32(y0);
+            yh[idx + 1u] = T::fromF32(y1);
         }
     }
     for (uint i = rotary_dim; i < head_dim; ++i) {
