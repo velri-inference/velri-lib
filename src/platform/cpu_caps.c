@@ -7,18 +7,16 @@
 #include <intrin.h>
 #else
 #include <cpuid.h>
+#include <immintrin.h>
 #endif
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
-static uint64_t read_xcr0(void) {
-#if defined(_MSC_VER)
-    return (uint64_t)_xgetbv(0);
-#else
-    uint32_t eax = 0, edx = 0;
-    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(eax), "=d"(edx) : "c"(0));
-    return ((uint64_t)edx << 32) | eax;
+#if !defined(_MSC_VER)
+__attribute__((target("xsave")))
 #endif
+static uint64_t read_xcr0(void) {
+    return (uint64_t)_xgetbv(0);
 }
 
 static void detect_x86_features(velri_cpu_info *info) {

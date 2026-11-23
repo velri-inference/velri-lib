@@ -80,7 +80,20 @@ typedef struct {
     size_t bytes;
 } velri_io_range;
 
+/* One backend-native representation for all uses of an immutable matrix. */
 typedef struct {
+    size_t bytes;
+    uint32_t channels;
+    uint32_t depth;
+    uint32_t stride;
+} velri_weight_packing;
+
+typedef struct {
+    const velri_prepared_op *packed_weight_op; /* Static backend descriptor for native weight operands. */
+    bool (*describe_weight)(const velri_resolved_op *op,
+                            uint32_t input, velri_weight_packing *out);
+    void (*pack_weight)(const velri_backend_device *dev, const velri_weight_packing *packing,
+                        const void *source, void *dst);
     velri_alloc_fn alloc_io;
     size_t max_readback_bytes;
     velri_status (*capture_outputs)(velri_backend_device *dev, const velri_submit_item *items,
@@ -150,11 +163,13 @@ typedef struct {
     velri_arena_kind arena_kind; /* Arena owning this storage's device memory (if any) */
     uint32_t slab_idx;           /* For VELRI_ARENA_WEIGHT: index in plan->weight_slabs[dev] */
     size_t arena_offset;         /* Byte offset inside the owning arena/slab */
+    velri_weight_packing packing;
 } velri_plan_storage;
 
 typedef struct {
     const void *host_ptr;
     size_t bound_bytes;
+    void *packed_mem;
     bool is_bound;
 } velri_plan_weight_binding;
 
@@ -175,6 +190,7 @@ typedef struct {
             uint32_t in_storage_idx[VELRI_OP_MAX_INPUTS];
             uint32_t out_storage_idx[VELRI_OP_MAX_OUTPUTS];
             velri_launch_batch batch;
+            bool uses_packed_weight;
             bool no_barrier_before; /* True => DAG analysis proved no RAW/WAR/WAW hazard in batch */
         } op;
         struct {
@@ -196,6 +212,7 @@ struct velri_plan {
 
     velri_plan_weight_binding *weight_bindings; /* Shared immutable WEIGHT bindings [num_user_storages] */
     velri_plan *weight_owner;                   /* Optional retained peer plan owning WEIGHT slabs/bindings */
+    bool has_packed_weights;
     uint32_t *weight_peer_sid;                  /* [num_user_storages] -> owner storage_id when borrowed */
 
     void *weight_slabs[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
@@ -218,6 +235,8 @@ struct velri_plan {
     velri_memory_report report;
 };
 
+extern const velri_device_hooks velri_cpu_device_hooks;
+velri_status velri_plan_prepare_host_weights(velri_plan *plan);
 void velri_plan_retain(velri_plan *plan);
 void velri_plan_release(velri_plan *plan);
 

@@ -45,6 +45,10 @@ enum {
     X(linear_w8a8_f32, (const int8_t *, uint32_t, const int8_t *, uint32_t, const float *,         \
                         const float *, const float *, uint32_t, float *, uint32_t, uint32_t,       \
                         uint32_t, uint32_t, uint32_t, uint32_t))                                   \
+    X(linear_w8a8_f32_packed, (const int8_t *, uint32_t, const int8_t *, const float *,            \
+                               const float *, const float *, uint32_t, float *, uint32_t,          \
+                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))                  \
+    X(pack_w8a8, (const int8_t *, uint32_t, uint32_t, uint32_t, int8_t *))                         \
     X(rmsnorm_f32, (const float *, uint32_t, const float *, uint32_t, float *, uint32_t, uint32_t, \
                     uint32_t, uint32_t, float, uint32_t))                                          \
     X(rmsnorm_bf16, (const uint16_t *, uint32_t, const uint16_t *, uint32_t, uint16_t *, uint32_t, \
@@ -100,10 +104,7 @@ typedef void (*slang_attn_fn)(const float *, uint32_t, const float *, uint32_t, 
 SLANG_CPU_KERNELS(DECL_BASE)
 #undef DECL_BASE
 
-typedef typeof(velri_slang_base_linear_w8a8_f32) slang_w8a8_fn;
-
 #if VELRI_X86_VARIANTS
-extern slang_w8a8_fn velri_slang_linear_w8a8_f32_vnni;
 #define DECL_AVX2(NAME, SIG) extern void velri_slang_avx2_##NAME SIG;
 #define DECL_AVX512(NAME, SIG) extern void velri_slang_avx512_##NAME SIG;
 SLANG_CPU_KERNELS(DECL_AVX2)
@@ -147,7 +148,6 @@ struct velri_backend_device {
     velri_pool *pool;
     size_t workers;
     const slang_cpu_vtable *vt;
-    slang_w8a8_fn *w8a8_gemm;
     atomic_flag pool_busy;
 };
 
@@ -201,12 +201,6 @@ static velri_status cpu_open_device(uint32_t local_index, const void *cfg,
     }
     dev->workers = nw;
     dev->vt = vt;
-    dev->w8a8_gemm = vt->linear_w8a8_f32;
-#if VELRI_X86_VARIANTS
-    if (vt == &g_vt_avx512 && velri_get_cpu_info()->has_avx512_vnni) {
-        dev->w8a8_gemm = velri_slang_linear_w8a8_f32_vnni;
-    }
-#endif
     atomic_flag_clear(&dev->pool_busy);
 
     if (nw > 1U) {
@@ -320,11 +314,44 @@ static velri_status cpu_query_operation(const velri_backend_device *dev,
     return st;
 }
 
+enum { W8A8_PANEL_WIDTH = 32 };
+struct velri_prepared_op { bool packed_w8a8; };
+static const velri_prepared_op cpu_packed_w8a8 = {.packed_w8a8 = true};
+
+static bool cpu_describe_weight(const velri_resolved_op *op,
+                                uint32_t input, velri_weight_packing *out) {
+    if (op->kind != VELRI_OP_LINEAR || input != 1 ||
+        velri_linear_classify(&op->raw.attr.linear.desc) != VELRI_LIN_W8A8_F32)
+        return false;
+    const velri_tensor_view *w = &op->inputs[input];
+    size_t channels;
+    if (w->byte_offset != 0 || w->strides[1] != 1 || w->strides[0] > UINT32_MAX ||
+        w->dims[0] > UINT32_MAX || w->dims[1] > UINT32_MAX ||
+        velri_align_up_overflow(w->dims[0], W8A8_PANEL_WIDTH, &channels) ||
+        velri_mul_overflow_size(channels, w->dims[1], &out->bytes))
+        return false;
+    out->channels = (uint32_t)w->dims[0];
+    out->depth = (uint32_t)w->dims[1];
+    out->stride = (uint32_t)w->strides[0];
+    return true;
+}
+
+static void cpu_pack_weight(const velri_backend_device *dev, const velri_weight_packing *p,
+                            const void *source, void *dst) {
+    dev->vt->pack_w8a8(source, p->stride, p->channels, p->depth, dst);
+}
+
+const velri_device_hooks velri_cpu_device_hooks = {
+    .packed_weight_op = &cpu_packed_w8a8,
+    .describe_weight = cpu_describe_weight,
+    .pack_weight = cpu_pack_weight,
+};
+
 /* ---- 5. Execution ---- */
 
 typedef struct {
     const slang_cpu_vtable *vt;
-    slang_w8a8_fn *w8a8;
+    bool packed_w8a8;
     const velri_resolved_op *op;
     const velri_buffer_binding *in_b;
     const velri_buffer_binding *out_b;
@@ -437,8 +464,13 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
                            bias ? VELRI_EP_FLAG_BIAS : 0U, (double *)y, ys, r0, r1, c0, c1, k);
             break;
         case VELRI_LIN_W8A8_F32:
-            c->w8a8((const int8_t *)x, xs, (const int8_t *)w, ws, (const float *)bias, xsc, wsc,
-                    flags, (float *)y, ys, r0, r1, c0, c1, k);
+            if (c->packed_w8a8) {
+                vt->linear_w8a8_f32_packed(x, xs, w, bias, xsc, wsc, flags, y, ys,
+                                           r0, r1, c0, c1, k);
+            } else {
+                vt->linear_w8a8_f32(x, xs, w, ws, bias, xsc, wsc, flags, y, ys,
+                                    r0, r1, c0, c1, k);
+            }
             break;
         case VELRI_LIN_UNSUPPORTED:
         default:
@@ -750,8 +782,13 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         if (st != VELRI_OK) {
             return st;
         }
-        ctx.w8a8 = (ctx.active_rows >= CPU_GEMV_ROW_THRESHOLD) ? dev->w8a8_gemm
-                                                               : dev->vt->linear_w8a8_f32;
+        ctx.packed_w8a8 = item->prepared == &cpu_packed_w8a8;
+        if (ctx.packed_w8a8) {
+            velri_weight_packing packing;
+            if (!cpu_describe_weight(op, 1U, &packing) ||
+                !velri_binding_range_valid(&item->inputs[1], packing.bytes))
+                return VELRI_ERR_INVALID;
+        }
         work_units = 2U; /* Always parallelize across M or rows */
         break;
 

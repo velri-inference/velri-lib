@@ -296,8 +296,10 @@ uint32_t velri_os_available_physical_cores(void) {
 void velri_os_cpu_relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
-#elif defined(__aarch64__)
-    __asm__ volatile("yield");
+#elif defined(__aarch64__) && __has_builtin(__builtin_arm_yield)
+    __builtin_arm_yield();
+#elif defined(__aarch64__) && __has_builtin(__builtin_aarch64_yield)
+    __builtin_aarch64_yield();
 #endif
 }
 

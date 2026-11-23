@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(VelriLib VERSION 0.4.0 LANGUAGES C)
+project(VelriLib VERSION 0.5.0 LANGUAGES C)
 include(GNUInstallDirs)
 
 set(CMAKE_C_STANDARD 23)
@@ -119,6 +119,7 @@ set(VELRI_SOURCES
     src/blocks/lm_head.c
     src/layers/pre_norm.c
     src/plan/planner.c
+    src/plan/weight_packing.c
     src/runtime/executor.c
     src/backend/cpu/cpu_backend.c
     ${VELRI_SLANG_CPU_OBJS}

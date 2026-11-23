@@ -96,6 +96,7 @@ typedef enum {
     LINEAR_RANDOM,
     LINEAR_F16_MATMUL,
     LINEAR_W8A8_EXTREMES,
+    LINEAR_PACKED_W8A8_EXTREMES,
 } linear_fixture;
 
 /* Keep the other rows and columns random. The first two dot products have opposite signs
@@ -116,7 +117,9 @@ static void prepare_w8a8_extremes(size_t rows, size_t m, size_t k, int8_t *x, si
             int64_t dot = 0;
             for (size_t i = 0U; i < k; ++i)
                 dot += (int)x[r * xs + i] * (int)w[c * ws + i];
-            const int32_t wrapped = (int32_t)(uint32_t)dot;
+            const uint32_t low = (uint32_t)dot;
+            const int64_t wrapped = (low <= INT32_MAX) ? (int64_t)low
+                                                       : (int64_t)low - (INT64_C(1) << 32);
             expected[r * ys + c] = (float)wrapped * (x_scale[r] * w_scale[c]) +
                                    (bias ? bias[c] : 0.0f);
             out[r * ys + c] = NAN;
@@ -131,6 +134,8 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
                               size_t k, size_t x_pad, size_t w_pad, size_t y_pad, bool with_bias,
                               double tol, linear_fixture fixture) {
     const bool allow_f16_matmul = fixture == LINEAR_F16_MATMUL;
+    const bool pack = fixture == LINEAR_PACKED_W8A8_EXTREMES;
+    const bool w8a8_extremes = pack || fixture == LINEAR_W8A8_EXTREMES;
     size_t xs = k + x_pad, ws = k + w_pad, ys = m + y_pad;
     size_t xb = velri_dtype_bytes(desc.x_dtype);
     size_t wb = velri_dtype_bytes(desc.w_dtype);
@@ -162,8 +167,9 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add linear");
 
     velri_plan *plan = nullptr;
-    velri_status pst = velri_plan_prepare(ctx, g, nullptr, &plan);
-    if (pst == VELRI_ERR_UNSUPPORTED && fixture != LINEAR_W8A8_EXTREMES) {
+    velri_status pst = pack ? velri_plan_prepare_ex(ctx, g, nullptr, VELRI_PLAN_PACK_CPU_WEIGHTS, &plan)
+                            : velri_plan_prepare(ctx, g, nullptr, &plan);
+    if (pst == VELRI_ERR_UNSUPPORTED && !w8a8_extremes) {
         velri_graph_destroy(g);
         return; /* Dtype combo intentionally unsupported on this device (e.g. FP64 on Vulkan) */
     }
@@ -184,12 +190,14 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     if (hxs) velri_test_fill_dtype(VELRI_DTYPE_F32, hxs, rows, &rng, 0.05f);
     if (hws) velri_test_fill_dtype(VELRI_DTYPE_F32, hws, m, &rng, 0.05f);
 
-    if (fixture == LINEAR_W8A8_EXTREMES)
+    if (w8a8_extremes)
         prepare_w8a8_extremes(rows, m, k, hx, xs, hw, ws, hxs, hws, hbias, hy_ref, hy, ys);
     else
         ref_linear_run(&desc, rows, m, k, hx, xs, hxs, hw, ws, hws, hbias, hy_ref, ys);
 
     CHECK_OK(velri_plan_bind_weight_host(plan, sw, hw, m * ws * wb), "bind w");
+    if (w8a8_extremes)
+        CHECK(velri_plan_weight_is_packed(plan, sw) == pack, "W8A8 plan weight layout");
     if (with_bias) CHECK_OK(velri_plan_bind_weight_host(plan, sb, hbias, m * yb), "bind bias");
     if (desc.has_w_scale) {
         CHECK_OK(velri_plan_bind_weight_host(plan, sws, hws, m * sizeof(float)), "bind ws");
@@ -205,7 +213,7 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     CHECK_OK(velri_slot_run(slot, nullptr, nullptr), label);
     CHECK(velri_slot_last_run_allocs(slot) == 0U, "0 hot-path allocs on linear");
 
-    size_t checked_cols = fixture == LINEAR_W8A8_EXTREMES ? ys : m;
+    size_t checked_cols = w8a8_extremes ? ys : m;
     double err = velri_test_max_abs_diff_2d(desc.y_dtype, hy_ref, hy, rows, checked_cols, ys);
     if (allow_f16_matmul) {
         velri_fp16 *x16 = xcalloc(rows * xs, sizeof(*x16));
@@ -240,6 +248,114 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     velri_plan_destroy(plan);
     velri_graph_destroy(g);
     free(hx); free(hw); free(hy_ref); free(hy); free(hbias); free(hxs); free(hws);
+}
+
+static void verify_w8a8_weight_packing(velri_context *ctx, velri_device_id dev,
+                                      velri_cpu_variant variant) {
+    enum { rows = 29, m = 131, k = 2051, xs = k + 2, ws = k + 4, ys = m + 6 };
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "packed W8A8 graph");
+    velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_I8, rows * xs, dev);
+    enum { w_align = 4096 };
+    velri_storage_desc weight_desc = {VELRI_STORAGE_WEIGHT, VELRI_DTYPE_I8, m * ws, w_align, dev};
+    velri_storage_id sw;
+    CHECK_OK(velri_graph_add_storage(g, &weight_desc, &sw), "aligned W8A8 weights");
+    velri_storage_id sb = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m, dev);
+    velri_storage_id sxs = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows, dev);
+    velri_storage_id sws = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m, dev);
+    velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, rows * ys, dev);
+    velri_op_desc op = {
+        .kind = VELRI_OP_LINEAR, .num_inputs = 5U, .num_outputs = 1U,
+        .inputs = {add_view_2d_strided(g, sx, VELRI_DTYPE_I8, rows, k, xs),
+                   add_view_2d_strided(g, sw, VELRI_DTYPE_I8, m, k, ws),
+                   add_view_1d(g, sb, VELRI_DTYPE_F32, m, 0U),
+                   add_view_1d(g, sxs, VELRI_DTYPE_F32, rows, 0U),
+                   add_view_1d(g, sws, VELRI_DTYPE_F32, m, 0U)},
+        .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, rows, m, ys)},
+        .dynamic_seq = true, .attr.linear.desc = velri_desc_w8a8_f32(),
+    };
+    CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "packed W8A8 op");
+    velri_plan *plan = nullptr;
+    CHECK_OK(velri_plan_prepare_ex(ctx, g, nullptr, VELRI_PLAN_PACK_CPU_WEIGHTS, &plan),
+             "packed W8A8 plan");
+    const velri_plan_options share_opts = {.share_weights_from = plan};
+    velri_plan *peer = nullptr;
+    CHECK_OK(velri_plan_prepare(ctx, g, &share_opts, &peer), "shared W8A8 plan");
+    velri_memory_report peer_memory;
+    CHECK_OK(velri_plan_memory_report(peer, &peer_memory), "shared W8A8 memory report");
+    CHECK(peer_memory.devices[dev].weight_bytes == 0 &&
+          velri_plan_weight_is_packed(peer, sw), "shared W8A8 layout");
+    velri_slot *slot = nullptr;
+    CHECK_OK(velri_slot_create(peer, &slot), "packed W8A8 slot");
+
+    int8_t *x = xcalloc(rows * xs, sizeof(*x));
+    float *expected = xcalloc(rows * ys, sizeof(*expected)), *y = xcalloc(rows * ys, sizeof(*y));
+    float x_scale[rows], w_scale[m], bias[m];
+    uint64_t rng = 0xF8A80001U;
+    velri_test_fill_dtype(VELRI_DTYPE_I8, x, rows * xs, &rng, 1.0f);
+    CHECK_OK(velri_slot_bind_host(slot, sx, x, rows * xs), "packed W8A8 x");
+    CHECK_OK(velri_slot_bind_host(slot, sxs, x_scale, sizeof(x_scale)), "packed W8A8 x scale");
+    CHECK_OK(velri_slot_bind_host(slot, sy, y, rows * ys * sizeof(*y)), "packed W8A8 output");
+    int8_t *weights[2] = {xcalloc(m * ws, sizeof(int8_t)), xcalloc(m * ws, sizeof(int8_t))};
+    for (unsigned bind = 0; bind < 2U; ++bind) {
+        int8_t *w = weights[bind];
+        velri_test_fill_dtype(VELRI_DTYPE_I8, w, m * ws, &rng, 1.0f);
+        prepare_w8a8_extremes(rows, m, k, x, xs, w, ws, x_scale, w_scale, bias, expected, y, ys);
+        CHECK_OK(velri_plan_bind_weight_host(plan, sw, w, m * ws), "bind or replace W8A8 weights");
+        CHECK_OK(velri_plan_bind_weight_host(plan, sws, w_scale, sizeof(w_scale)), "W8A8 w scale");
+        CHECK_OK(velri_plan_bind_weight_host(plan, sb, bias, sizeof(bias)), "W8A8 bias");
+        CHECK(velri_plan_weight_is_packed(plan, sw), "packed W8A8 binding");
+        CHECK(!velri_plan_weight_is_packed(plan, sws), "W8A8 scales keep their original layout");
+        memset(w, 0, m * ws);
+        CHECK(velri_plan_bind_weight_host(plan, sw, w, m * ws - 1U) == VELRI_ERR_INVALID,
+              "undersized W8A8 rebind rejected");
+
+        velri_memory_report rep;
+        CHECK_OK(velri_plan_memory_report(plan, &rep), "W8A8 memory report");
+        size_t packed_m = (m + 31U) / 32U * 32U;
+        size_t matrix_bytes = packed_m * k;
+        size_t padding = (w_align - matrix_bytes % w_align) % w_align;
+        CHECK(rep.devices[dev].weight_bytes == matrix_bytes + sizeof(w_scale) + sizeof(bias) &&
+              rep.devices[dev].allocator_overhead_bytes == padding,
+              "CPU memory report counts one native matrix and its allocation padding");
+
+        const size_t active[] = {1U, 2U, 3U, rows};
+        for (size_t i = 0U; i < sizeof(active) / sizeof(active[0]); ++i) {
+            const float untouched = -1234.5f;
+            for (size_t j = 0; j < rows * ys; ++j) y[j] = untouched;
+            velri_step_params step = {.has_seq_len = true, .seq_len_override = active[i]};
+            CHECK_OK(velri_slot_run(slot, &step, nullptr), "W8A8 decode or prefill");
+            CHECK(velri_slot_last_run_allocs(slot) == 0U, "W8A8 hot path allocation count");
+            for (size_t r = 0; r < rows; ++r)
+                for (size_t c = 0; c < ys; ++c) {
+                    float want = r < active[i] && c < m ? expected[r * ys + c] : untouched;
+                    if (y[r * ys + c] != want) {
+                        fprintf(stderr, "FAIL W8A8 variant=%d bind=%u rows=%zu at [%zu,%zu]: "
+                                        "got %g expected %g\n", (int)variant, bind, active[i],
+                                r, c, y[r * ys + c], want);
+                        exit(1);
+                    }
+                }
+        }
+    }
+    /* A second, overlapping view of the same bytes requires the original row-major layout. */
+    const velri_tensor_view offset_w = {.storage_id = sw, .dtype = VELRI_DTYPE_I8, .rank = 2,
+                                       .dims = {m, k}, .strides = {ws, 1}, .byte_offset = 1};
+    CHECK_OK(velri_graph_add_view(g, &offset_w, &op.inputs[1]), "overlapping W8A8 view");
+    CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "second W8A8 projection");
+    velri_plan *mixed = nullptr;
+    CHECK_OK(velri_plan_prepare_ex(ctx, g, nullptr, VELRI_PLAN_PACK_CPU_WEIGHTS, &mixed),
+             "W8A8 shared across incompatible views");
+    CHECK(!velri_plan_weight_is_packed(mixed, sw), "mixed views borrow original weights");
+    velri_plan_destroy(mixed);
+    CHECK(velri_plan_prepare(ctx, g, &share_opts, &mixed) == VELRI_ERR_INVALID && !mixed,
+          "borrower cannot reinterpret packed bytes with an incompatible view");
+
+    velri_plan_destroy(peer);
+    velri_slot_destroy(slot);
+    velri_plan_destroy(plan);
+    velri_graph_destroy(g);
+    free(weights[0]); free(weights[1]); free(x); free(y); free(expected);
 }
 
 // The mixed kernel receives original F32 projections. Round only the reference K/V
@@ -696,6 +812,8 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
                           7U, 5U, 132106U, 1U, 5U, 7U, true, 0.0, LINEAR_W8A8_EXTREMES);
         verify_linear_one(ctx, dev, tag, "W8A8 multi-panel GEMM", velri_desc_w8a8_f32(),
                           29U, 259U, 2051U, 2U, 6U, 3U, true, 0.0, LINEAR_W8A8_EXTREMES);
+        verify_linear_one(ctx, dev, tag, "W8A8 strided GEMM tails", velri_desc_w8a8_f32(),
+                          127U, 131U, 516U, 3U, 5U, 7U, true, 0.0, LINEAR_W8A8_EXTREMES);
         verify_linear_one(ctx, dev, tag, "W8A8 multi-block GEMM", velri_desc_w8a8_f32(),
                           281U, 1051U, 68U, 3U, 5U, 7U, false, 0.0, LINEAR_W8A8_EXTREMES);
     }
@@ -2283,6 +2401,13 @@ int main(void) {
         velri_device_id cpu_dev = 0U;
         CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &cpu_dev), "find cpu");
         verify_all_ops_on_device(ctx, cpu_dev, vnames[vi], false);
+        verify_w8a8_weight_packing(ctx, cpu_dev, vars[vi]);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 GEMV signed overflow",
+                          velri_desc_w8a8_f32(), 3U, 9U, 132105U, 2U, 4U, 5U, false,
+                          0.0, LINEAR_PACKED_W8A8_EXTREMES);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 GEMM signed overflow",
+                          velri_desc_w8a8_f32(), 14U, 5U, 132106U, 1U, 5U, 7U, true,
+                          0.0, LINEAR_PACKED_W8A8_EXTREMES);
         velri_context_destroy(ctx);
     }
 

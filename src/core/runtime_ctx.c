@@ -118,7 +118,7 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
         .use_physical_cores = ctx->cfg.use_physical_cores,
         .reserve_cores = ctx->cfg.cpu_reserve_cores,
     };
-    velri_status st = register_backend_with_cfg(ctx, velri_cpu_backend_vtable(), &cpu_cfg, nullptr);
+    velri_status st = register_backend_with_cfg(ctx, velri_cpu_backend_vtable(), &cpu_cfg, &velri_cpu_device_hooks);
     if (st != VELRI_OK) {
         velri_context_release(ctx);
         return st;

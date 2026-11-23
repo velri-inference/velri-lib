@@ -373,44 +373,88 @@ public void linear_slice_cpu<let MR : int, let NR : int,
 // ============================================================================
 // 5. Exact INT8 * INT8 -> INT32 (modulo 2^32) & W8A8 -> F32
 // ============================================================================
-public void linear_w8a8_f32_slice_cpu<let MR : int, let NR : int>(
+// Packed weights store signed bytes in [channel panel][depth][channel] order.
+// Each panel is 32 columns wide, including the zero-padded last panel.
+static const uint kW8A8PanelWidth = 32u;
+
+public void pack_w8a8_cpu(Ptr<int8_t, Access.Read> w, uint stride,
+                          uint channels, uint depth, Ptr<int8_t> packed)
+{
+    for (uint64_t col = 0; col < channels; col += kW8A8PanelWidth) {
+        uint width = min(kW8A8PanelWidth, channels - uint(col));
+        Ptr<int8_t> panel = packed + col * depth;
+        for (uint k = 0; k < depth; ++k) {
+            Ptr<int8_t> dst = panel + uint64_t(k) * kW8A8PanelWidth;
+            for (uint j = 0; j < width; ++j) dst[j] = w[(col + j) * stride + k];
+            for (uint j = width; j < kW8A8PanelWidth; ++j) dst[j] = int8_t(0);
+        }
+    }
+}
+
+Ptr<int8_t, Access.Read> w8a8_column<let PACKED : bool>(
+    Ptr<int8_t, Access.Read> w, uint stride, uint col)
+{
+    if (PACKED) {
+        uint lane = col % kW8A8PanelWidth;
+        return w + uint64_t(col - lane) * stride + lane;
+    }
+    return w + uint64_t(col) * stride;
+}
+
+void w8a8_gemv_columns<let PACKED : bool, let COLS : int>(
+    Ptr<int8_t, Access.Read> x, Ptr<int8_t, Access.Read> w, uint stride,
+    Ptr<float> y, uint row, uint col, uint k, EpilogueParams ep)
+{
+    Ptr<int8_t, Access.Read> columns[COLS];
+    uint sums[COLS];
+    [ForceUnroll] for (uint j = 0; j < uint(COLS); ++j) {
+        columns[j] = w8a8_column<PACKED>(w, stride, col + j);
+        sums[j] = 0;
+    }
+    for (uint i = 0; i < k; ++i) {
+        uint64_t index = PACKED ? uint64_t(i) * kW8A8PanelWidth : uint64_t(i);
+        int a = int(x[i]);
+        [ForceUnroll] for (uint j = 0; j < uint(COLS); ++j)
+            sums[j] += uint(a * int(columns[j][index]));
+    }
+    [ForceUnroll] for (uint j = 0; j < uint(COLS); ++j)
+        y[col + j] = EpQuantScale::apply(float(int32_t(sums[j])), row, col + j, ep);
+}
+
+void unpack_w8a8_panel<let NR : int>(Ptr<int8_t, Access.Read> src, uint width,
+                                     uint depth, Ptr<float> dst)
+{
+    for (uint p = 0; p < depth; ++p) {
+        uint j = 0;
+        for (; j + 4 <= width; j += 4) {
+            float4 v = ElemI8::load4F32(src + j);
+            [ForceUnroll] for (uint i = 0; i < 4; ++i) dst[j + i] = v[i];
+        }
+        for (; j < width; ++j) dst[j] = ElemI8::toF32(src[j]);
+        for (; j < uint(NR); ++j) dst[j] = 0.0f;
+        src = src + kW8A8PanelWidth;
+        dst = dst + NR;
+    }
+}
+
+public void linear_w8a8_f32_slice_cpu<let MR : int, let NR : int, let PACKED : bool>(
     Ptr<int8_t, Access.Read> x, uint x_stride,
     Ptr<int8_t, Access.Read> w, uint w_stride,
     Ptr<float> y, uint y_stride,
     uint r0, uint r1, uint c0, uint c1, uint k,
     EpilogueParams ep)
 {
-    uint nrows = r1 - r0;
-    uint64_t ws64 = uint64_t(w_stride);
-    if (nrows < kGemvRowThreshold) {
+    static_assert(kKC > 0 && kKC <= 1024, "Each INT8 K block must sum exactly in F32");
+    if (r0 >= r1 || c0 >= c1) return;
+    if (r1 - r0 < kGemvRowThreshold) {
         for (uint r = r0; r < r1; ++r) {
-            Ptr<int8_t, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
-            Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
+            Ptr<int8_t, Access.Read> xr = x + uint64_t(r) * x_stride;
+            Ptr<float> yr = y + uint64_t(r) * y_stride;
             uint c = c0;
-            for (; c + 4u <= c1; c += 4u) {
-                Ptr<int8_t, Access.Read> w0 = w + uint64_t(c + 0u) * ws64;
-                Ptr<int8_t, Access.Read> w1 = w + uint64_t(c + 1u) * ws64;
-                Ptr<int8_t, Access.Read> w2 = w + uint64_t(c + 2u) * ws64;
-                Ptr<int8_t, Access.Read> w3 = w + uint64_t(c + 3u) * ws64;
-                uint32_t s0 = 0u, s1 = 0u, s2 = 0u, s3 = 0u;
-                for (uint i = 0u; i < k; ++i) {
-                    int16_t xv = int16_t(xr[i]);
-                    s0 += uint32_t(int32_t(xv * int16_t(w0[i])));
-                    s1 += uint32_t(int32_t(xv * int16_t(w1[i])));
-                    s2 += uint32_t(int32_t(xv * int16_t(w2[i])));
-                    s3 += uint32_t(int32_t(xv * int16_t(w3[i])));
-                }
-                yr[c + 0u] = EpQuantScale::apply(float(int32_t(s0)), r, c + 0u, ep);
-                yr[c + 1u] = EpQuantScale::apply(float(int32_t(s1)), r, c + 1u, ep);
-                yr[c + 2u] = EpQuantScale::apply(float(int32_t(s2)), r, c + 2u, ep);
-                yr[c + 3u] = EpQuantScale::apply(float(int32_t(s3)), r, c + 3u, ep);
-            }
-            for (; c < c1; ++c) {
-                Ptr<int8_t, Access.Read> wc = w + uint64_t(c) * ws64;
-                uint32_t s = 0u;
-                for (uint i = 0u; i < k; ++i) s += uint32_t(int32_t(int16_t(xr[i]) * int16_t(wc[i])));
-                yr[c] = EpQuantScale::apply(float(int32_t(s)), r, c, ep);
-            }
+            for (; c1 - c >= 4; c += 4)
+                w8a8_gemv_columns<PACKED, 4>(xr, w, w_stride, yr, r, c, k, ep);
+            for (; c < c1; ++c)
+                w8a8_gemv_columns<PACKED, 1>(xr, w, w_stride, yr, r, c, k, ep);
         }
         return;
     }
@@ -422,43 +466,44 @@ public void linear_w8a8_f32_slice_cpu<let MR : int, let NR : int>(
     bp4[0] = float4(0.0f); ap[0] = 0.0f; c_tmp[0] = 0.0f; c_i32[0] = 0u;
     Ptr<float> bp = Ptr<float>(&bp4[0]);
 
-    for (uint cb = c0; cb < c1; cb += uint(NR)) {
+    for (uint cb = c0; cb < c1;) {
         uint nr = min(uint(NR), c1 - cb);
-        for (uint rb = r0; rb < r1; rb += kMC) {
+        if (PACKED) nr = min(nr, kW8A8PanelWidth - cb % kW8A8PanelWidth);
+        for (uint rb = r0; rb < r1;) {
             uint mc = min(kMC, r1 - rb);
-            for (uint k0 = 0u; k0 < k; k0 += kKC) {
+            for (uint k0 = 0; k0 < k;) {
                 uint kc = min(kKC, k - k0);
-                pack_b_f32<ElemI8, NR>(w, w_stride, cb, nr, k0, kc, &bp4[0]);
-                bool first = (k0 == 0u);
+                if (PACKED) {
+                    Ptr<int8_t, Access.Read> panel = w8a8_column<true>(w, w_stride, cb);
+                    unpack_w8a8_panel<NR>(panel + uint64_t(k0) * kW8A8PanelWidth, nr, kc, bp);
+                } else {
+                    pack_b_f32<ElemI8, NR>(w, w_stride, cb, nr, k0, kc, &bp4[0]);
+                }
                 for (uint rm = 0u; rm < mc; rm += uint(MR)) {
                     uint mr = min(uint(MR), mc - rm);
                     pack_a_f32<ElemI8, MR>(x, x_stride, rb + rm, mr, k0, kc, &ap[0]);
                     gemm_mk_f32<MR, NR, true>(Ptr<float, Access.Read>(&ap[0]), kKC, bp, &c_tmp[0], uint(NR), kc);
-                    if (first) {
-                        for (uint r = 0u; r < mr; ++r) {
-                            uint dst_off = (rm + r) * uint(NR);
-                            uint src_off = r * uint(NR);
-                            for (uint j = 0u; j < uint(NR); ++j)
-                                c_i32[dst_off + j] = uint32_t(int32_t(c_tmp[src_off + j]));
-                        }
-                    } else {
-                        for (uint r = 0u; r < mr; ++r) {
-                            uint dst_off = (rm + r) * uint(NR);
-                            uint src_off = r * uint(NR);
-                            for (uint j = 0u; j < uint(NR); ++j)
-                                c_i32[dst_off + j] += uint32_t(int32_t(c_tmp[src_off + j]));
+                    for (uint r = 0; r < mr; ++r) {
+                        for (uint j = 0; j < nr; ++j) {
+                            uint dst = (rm + r) * uint(NR) + j;
+                            uint partial = uint(int32_t(c_tmp[r * uint(NR) + j]));
+                            c_i32[dst] = k0 == 0 ? partial : c_i32[dst] + partial;
                         }
                     }
                 }
+                k0 += kc;
             }
             for (uint rm = 0u; rm < mc; ++rm) {
                 uint rr = rb + rm;
                 Ptr<float> yr = y + uint64_t(rr) * uint64_t(y_stride) + uint64_t(cb);
                 for (uint j = 0u; j < nr; ++j) {
-                    yr[j] = EpQuantScale::apply(float(int32_t(c_i32[rm * uint(NR) + j])), rr, cb + j, ep);
+                    uint sum = k == 0 ? 0u : c_i32[rm * uint(NR) + j];
+                    yr[j] = EpQuantScale::apply(float(int32_t(sum)), rr, cb + j, ep);
                 }
             }
+            rb += mc;
         }
+        cb += nr;
     }
 }
 

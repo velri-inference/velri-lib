@@ -75,6 +75,85 @@ static velri_view_id add_1d_view(velri_graph *g, velri_storage_id sid, size_t n)
     return add_1d_view_off(g, sid, n, 0U);
 }
 
+static velri_view_id add_i8_matrix(velri_graph *g, velri_storage_kind kind, velri_device_id dev,
+                                   size_t rows, size_t cols, velri_storage_id *sid) {
+    velri_storage_desc storage = {
+        .kind = kind, .dtype = VELRI_DTYPE_I8, .byte_size = rows * cols, .align = 64U, .device_id = dev,
+    };
+    CHECK_OK(velri_graph_add_storage(g, &storage, sid), "i8 matrix storage");
+    const size_t dims[2] = {rows, cols};
+    velri_tensor_view view;
+    velri_view_id id;
+    CHECK_OK(velri_tensor_view_contiguous(*sid, VELRI_DTYPE_I8, 2, dims, 0, &view), "i8 matrix");
+    CHECK_OK(velri_graph_add_view(g, &view, &id), "add i8 matrix");
+    return id;
+}
+
+/* Run the real row-major linear operation on a second backend with explicit device copies.
+ * This exercises the transfer even on hosts without a Vulkan device. */
+static velri_status remote_cpu_caps(const velri_backend_device *dev, velri_device_caps *caps) {
+    velri_status st = velri_cpu_backend_vtable()->query_caps(dev, caps);
+    if (st == VELRI_OK) {
+        caps->is_host_memory = false;
+        caps->is_uma = false;
+    }
+    return st;
+}
+
+static void test_w8a8_shared_with_remote(velri_context *ctx, velri_device_id cpu,
+                                         velri_device_id remote) {
+    enum { m = 3, k = 5 };
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "heterogeneous W8A8 graph");
+    velri_storage_id sx, sw;
+    velri_view_id vx = add_i8_matrix(g, VELRI_STORAGE_INPUT, cpu, 1U, k, &sx);
+    velri_view_id vw = add_i8_matrix(g, VELRI_STORAGE_WEIGHT, cpu, m, k, &sw);
+    velri_storage_id sxs = add_f32_storage(g, VELRI_STORAGE_INPUT, 1U, cpu);
+    velri_storage_id sws = add_f32_storage(g, VELRI_STORAGE_WEIGHT, m, cpu);
+    velri_storage_id sy = add_f32_storage(g, VELRI_STORAGE_OUTPUT, m, cpu);
+    velri_storage_id sz = add_f32_storage(g, VELRI_STORAGE_OUTPUT, m, remote);
+    velri_op_desc op = {
+        .kind = VELRI_OP_LINEAR, .num_inputs = 5U, .num_outputs = 1U,
+        .inputs = {vx, vw, VELRI_INVALID_ID, add_1d_view(g, sxs, 1U), add_1d_view(g, sws, m)},
+        .outputs = {add_2d_view(g, sy, 1U, m)}, .attr.linear.desc = velri_desc_w8a8_f32(),
+    };
+    CHECK_OK(velri_graph_add_op(g, &op, cpu, nullptr), "CPU W8A8 consumer");
+    velri_plan *plan = nullptr;
+    CHECK_OK(velri_plan_prepare_ex(ctx, g, nullptr, VELRI_PLAN_PACK_CPU_WEIGHTS, &plan),
+             "CPU-local W8A8 plan");
+    CHECK(velri_plan_weight_is_packed(plan, sw), "CPU-local W8A8 weights can be packed");
+    velri_plan_destroy(plan);
+    op.outputs[0] = add_2d_view(g, sz, 1U, m);
+    CHECK_OK(velri_graph_add_op(g, &op, remote, nullptr), "remote W8A8 consumer");
+    CHECK_OK(velri_plan_prepare_ex(ctx, g, nullptr, VELRI_PLAN_PACK_CPU_WEIGHTS, &plan),
+             "heterogeneous W8A8 plan");
+    CHECK(!velri_plan_weight_is_packed(plan, sw), "remote consumer requires row-major weights");
+    velri_memory_report report;
+    CHECK_OK(velri_plan_memory_report(plan, &report), "heterogeneous W8A8 report");
+    CHECK(report.num_ram_transfers == 4U, "remote operation receives both matrices and scales");
+
+    int8_t x[k] = {2, -3, 5, 7, -11};
+    int8_t w[m][k] = {{-128, -7, 6, 9, 11}, {4, 3, -2, 0, 127}, {3, -9, 0, 8, -1}};
+    float xs = 0.5f, ws[m] = {1.0f, 0.25f, 2.0f}, y[m] = {0}, z[m] = {0};
+    CHECK_OK(velri_plan_bind_weight_host(plan, sw, w, sizeof(w)), "shared row-major W");
+    CHECK_OK(velri_plan_bind_weight_host(plan, sws, ws, sizeof(ws)), "shared scales");
+    velri_slot *slot = nullptr;
+    CHECK_OK(velri_slot_create(plan, &slot), "heterogeneous W8A8 slot");
+    CHECK_OK(velri_slot_bind_host(slot, sx, x, sizeof(x)), "activation");
+    CHECK_OK(velri_slot_bind_host(slot, sxs, &xs, sizeof(xs)), "activation scale");
+    CHECK_OK(velri_slot_bind_host(slot, sy, y, sizeof(y)), "CPU result");
+    CHECK_OK(velri_slot_bind_host(slot, sz, z, sizeof(z)), "remote result");
+    CHECK_OK(velri_slot_run(slot, nullptr, nullptr), "heterogeneous W8A8 run");
+    for (size_t c = 0; c < m; ++c) {
+        int dot = 0;
+        for (size_t i = 0; i < k; ++i) dot += (int)x[i] * w[c][i];
+        CHECK(y[c] == (float)dot * xs * ws[c] && z[c] == y[c], "both devices read row-major W");
+    }
+    velri_slot_destroy(slot);
+    velri_plan_destroy(plan);
+    velri_graph_destroy(g);
+}
+
 /* ---- Test 1: TensorView/subview bounds, graph immutability, aliasing, alignment ---- */
 static void test_validation_and_guards(velri_context *ctx, velri_device_id cpu_dev) {
     velri_graph *g = nullptr;
@@ -1107,6 +1186,13 @@ int main(void) {
     test_refcounted_lifetimes_and_graph_growth();
     test_errors_and_cancellation(ctx, cpu_dev, mock_dev);
     test_shared_weights_and_shared_state_dual_plan(ctx, cpu_dev, mock_dev);
+    velri_backend_vtable remote = *velri_cpu_backend_vtable();
+    remote.name = "remote_linear";
+    remote.query_caps = remote_cpu_caps;
+    CHECK_OK(velri_context_register_backend(ctx, &remote), "register remote linear backend");
+    velri_device_id remote_dev;
+    CHECK_OK(velri_context_find_device(ctx, remote.name, 0U, &remote_dev), "find remote linear");
+    test_w8a8_shared_with_remote(ctx, cpu_dev, remote_dev);
 #ifdef VELRI_CORE_HAS_VULKAN
     velri_device_id vk_dev;
     if (velri_context_find_device(ctx, "vulkan", 0U, &vk_dev) == VELRI_OK) {

@@ -83,7 +83,7 @@ Slang supports CPU emission via LLVM (`slang-llvm`: LLVM IR / `.o`) and C++. We 
 1. The C++ backend lacks workgroup barriers (`GroupMemoryBarrierWithGroupSync`) and general user atomics — `groupshared`-synchronized GPU shaders do not port directly to CPU.
 2. Default C++ output carries wrapper overhead unsuitable for short `velri_pool` dispatches; CPU targets need direct **LLVM IR / `.o` lowering with a clean C-ABI** and `0 B` heap allocations.
 3. One Slang source compiles to target LLVM IR, and **compiler target flags** (`-march=x86-64`, `-mavx2 -mfma -mf16c`, `-mavx512f -mavx512bw ...`, `aarch64`, `riscv64`) emit ISA variants — **without duplicating kernel code for AVX2 vs. AVX-512**.
-4. Hot CPU `GEMM` / `GEMV` requires register tiling, bounded `scratch` panel packing, and hardware dot instructions (`vdpbf16ps`, `vpdpbusd`). Wherever stock Slang CPU codegen falls short, we measure the exact gap and apply targeted Slang CPU backend improvements (clean C-ABI, `fp16`/`bf16`, vector primitives/intrinsics).
+4. Write CPU compute kernels in portable Slang. Express tiling, packing and arithmetic in the shared source. The compiler selects machine instructions for each target. Handwritten assembly, embedded LLVM IR and ISA-specific intrinsics are excluded from CPU kernels.
 
 ### Verified Slang `2026.22.1` findings and limits
 Slang CPU is always built into `VelriLib::velri` (`entry_cpu.slang`); Vulkan is opt-in via `-DVELRI_ENABLE_VULKAN=ON` (`vk/*.slang`), and both backends are verified end-to-end by `test_kernels` (with optional `bench_slang_cpu`/`bench_vulkan` under `-DVELRI_BUILD_BENCHMARKS=ON`). With `slangc 2026.22.1`, both targets are verified from shared `common/` modules:
@@ -98,8 +98,11 @@ Slang CPU is always built into `VelriLib::velri` (`entry_cpu.slang`); Vulkan is 
 - **Vulkan (`-target spirv -profile spirv_1_6 -fvk-use-c-layout -O3`):** under C layout Slang defaults BDA accesses to `Aligned 4` (`4× LDG.32`), so explicit `OpLoad`/`OpStore Aligned 16` helpers (`LDG.128`/`STG.128`), `ks=0 / BAR / STS.128 + ks=1` overlap on single-buffered `CoopMat` (`20 KiB` -> `2 WGs/SM`), and `Split-K` (`vk_splitk_reduce`) for small-batch `F32` are essential.
 - **Remaining upstream `slang-llvm` `2026.22.1` gaps (scope for future Slang CPU backend work):**
   1. **`BFloat16` is unsupported on the LLVM target** (`InternalError: Unsupported type for LLVM target!`) — bit-shift `ElemBF16` (`uint16_t`) is used instead, preventing `vdpbf16ps` (`AVX512_BF16`) emission.
-  2. **`dot4add_i8packed` and integer dot products do not lower to `vpdpbusd` (`AVX512_VNNI`) on CPU**. For W8A8 GEMM on AVX-512 VNNI, `w8a8_vnni.slang` calls the LLVM intrinsic directly. It packs panels of row-major weights during the operation and accumulates a 14×32 tile in INT32. Dispatch checks VNNI separately from AVX-512. Batches of 1–3 rows use the GEMV path.
+  2. With this compiler version, portable integer dot expressions on CPU can lower to separate multiplies and adds. W8A8 GEMV uses signed byte products and unsigned 32-bit accumulation. GEMM reuses the shared floating-point microkernel for bounded, exactly representable K-block sums and combines those sums modulo $2^{32}$.
+
   3. **Official prebuilt `libslang-llvm.so` bundles only `X86` and `AArch64` LLVM backends:** in `OBJECT` mode (with GCC), targets such as `RISC-V 64` are unavailable; use the standard `LLVM_IR -> Clang` pipeline ([riscv64-linux-gnu.cmake](../../cmake/toolchains/riscv64-linux-gnu.cmake)), where Clang compiles `.ll` directly to `rv64gc` or `rv64gcv` (RVV 1.0).
+
+Pass `VELRI_PLAN_PACK_CPU_WEIGHTS` to `velri_plan_prepare_ex` to pack eligible CPU W8A8 matrices at bind time. All CPU profiles use the same signed-byte layout of 32 output channels per panel. An M × K matrix takes `round_up(M, 32) * K` bytes, plus allocator alignment. Check `velri_plan_weight_is_packed` before releasing the source after a successful bind. Slots and compatible plans share the packed storage. Weights used by a transfer or through incompatible views retain the original layout.
 
 ### Acceptance rules for new Slang kernels
 Every new or optimized Slang kernel is accepted only after it:

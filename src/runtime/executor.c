@@ -105,7 +105,7 @@ static velri_buffer_binding resolve_storage_binding(const velri_slot *slot,
         const velri_plan *wplan = plan->weight_owner ? plan->weight_owner : plan;
         uint32_t widx = plan->weight_owner ? plan->weight_peer_sid[plan_storage_idx] : plan_storage_idx;
         const velri_plan_weight_binding *wb = &wplan->weight_bindings[widx];
-        b.mem_handle = (void *)wb->host_ptr;
+        b.mem_handle = wb->packed_mem ? wb->packed_mem : (void *)wb->host_ptr;
         b.byte_offset = view_byte_offset;
         b.byte_size = wb->bound_bytes;
         b.is_host_ptr = true;
@@ -225,10 +225,16 @@ velri_status velri_plan_bind_weight_host(velri_plan *plan, velri_storage_id stor
 
     const velri_plan_storage *ps = &plan->storages[storage_id];
     velri_plan_weight_binding *wb = &plan->weight_bindings[storage_id];
+    velri_device_entry *de = &plan->ctx->devices[ps->device_id];
+    if (wb->packed_mem) {
+        de->hooks->pack_weight(de->dev, &ps->packing, host_ptr, wb->packed_mem);
+        wb->bound_bytes = ps->packing.bytes;
+        wb->is_bound = true;
+        return VELRI_OK;
+    }
     wb->host_ptr = host_ptr;
     wb->bound_bytes = byte_size;
 
-    velri_device_entry *de = &plan->ctx->devices[ps->device_id];
     if (!de->caps.is_host_memory) {
         velri_buffer_binding dst = {
             .mem_handle = plan->weight_slabs[ps->device_id][ps->slab_idx],
@@ -272,7 +278,9 @@ static bool populate_batch_items(velri_slot *slot, uint32_t first_step, uint32_t
         }
         slot->batch_items[k] = (velri_submit_item){
             .op = op,
-            .prepared = step->u.op.prepared,
+            .prepared = step->u.op.uses_packed_weight
+                            ? plan->ctx->devices[step->u.op.device_id].hooks->packed_weight_op
+                            : step->u.op.prepared,
             .inputs = slot->batch_in[k],
             .num_inputs = op->num_inputs,
             .outputs = slot->batch_out[k],

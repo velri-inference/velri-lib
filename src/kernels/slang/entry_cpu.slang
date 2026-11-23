@@ -80,8 +80,24 @@ import batched_linear;
     Ptr<float, Access.Read> w_scale, uint flags, Ptr<float> y, uint ys,
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
-    linear_w8a8_f32_slice_cpu<VELRI_MR, VELRI_NR_F32>(
+    linear_w8a8_f32_slice_cpu<VELRI_MR, VELRI_NR_F32, false>(
         x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, x_scale, w_scale, flags));
+}
+
+[DllExport] export __extern_cpp void VSYM(pack_w8a8)(
+    Ptr<int8_t, Access.Read> w, uint stride, uint channels, uint depth, Ptr<int8_t> packed)
+{
+    pack_w8a8_cpu(w, stride, channels, depth, packed);
+}
+
+[DllExport] export __extern_cpp void VSYM(linear_w8a8_f32_packed)(
+    Ptr<int8_t, Access.Read> x, uint xs, Ptr<int8_t, Access.Read> packed_w,
+    Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_scale,
+    Ptr<float, Access.Read> w_scale, uint flags, Ptr<float> y, uint ys,
+    uint r0, uint r1, uint c0, uint c1, uint k)
+{
+    linear_w8a8_f32_slice_cpu<VELRI_MR, VELRI_NR_F32, true>(
+        x, xs, packed_w, k, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, x_scale, w_scale, flags));
 }
 
 // ---- Normalization ----

@@ -48,7 +48,6 @@ typedef struct {
     double bw_copy_gbps;
     double fma_f32_gflops;
     double fma_f64_gflops;
-    double vnni_i8_gops;
 } cpu_ceilings;
 
 typedef struct {
@@ -118,28 +117,6 @@ __attribute__((target("avx512f,fma"))) static void ceil_fma_f64_worker(void *v, 
     c->sink[wid] = _mm512_reduce_add_pd(s);
 }
 
-enum { VNNI_CHAINS = 12 };
-
-__attribute__((target("avx512f,avx512vnni"))) static void ceil_vnni_worker(void *v, size_t wid,
-                                                                          size_t nw) {
-    (void)nw;
-    cpu_compute_ctx *c = (cpu_compute_ctx *)v;
-    __m512i acc[VNNI_CHAINS];
-    volatile int32_t seed = 0x01020304 + (int32_t)wid;
-    __m512i b = _mm512_set1_epi32(seed);
-    __m512i a = _mm512_set1_epi32(0x04030201);
-    for (int j = 0; j < VNNI_CHAINS; ++j) {
-        seed = 0x04030201 + (int32_t)wid + j;
-        acc[j] = _mm512_set1_epi32(seed);
-    }
-    for (size_t i = 0; i < c->iters; ++i) {
-        for (int j = 0; j < VNNI_CHAINS; ++j)
-            acc[j] = _mm512_dpbusd_epi32(acc[j], a, b);
-    }
-    __m512i sum = acc[0];
-    for (int j = 1; j < VNNI_CHAINS; ++j) sum = _mm512_add_epi32(sum, acc[j]);
-    c->sink[wid] = (double)_mm512_reduce_or_epi32(sum);
-}
 #endif
 
 static cpu_ceilings measure_cpu_ceilings(size_t nw) {
@@ -190,17 +167,6 @@ static cpu_ceilings measure_cpu_ceilings(size_t nw) {
             double gf = (double)nw * (double)fctx.iters * 12.0 * 16.0 / (now_sec() - t0) / 1e9;
             if (gf > out.fma_f64_gflops) out.fma_f64_gflops = gf;
         }
-        if (velri_get_cpu_info()->has_avx512_vnni) {
-            // One 512-bit VPDPBUSD performs 64 byte multiplies and 64 integer adds.
-            double ops = (double)nw * (double)fctx.iters * VNNI_CHAINS * 128.0;
-            velri_pool_parallel(pool, nw, ceil_vnni_worker, &fctx);
-            for (int s = 0; s < 5; ++s) {
-                double t0 = now_sec();
-                velri_pool_parallel(pool, nw, ceil_vnni_worker, &fctx);
-                double gops = ops / (now_sec() - t0) / 1e9;
-                if (gops > out.vnni_i8_gops) out.vnni_i8_gops = gops;
-            }
-        }
     }
 #endif
     velri_pool_destroy(pool);
@@ -212,8 +178,6 @@ static cpu_ceilings measure_cpu_ceilings(size_t nw) {
         printf("  AVX-512 FP32 FMA Peak        : %7.1f GFLOPS\n", out.fma_f32_gflops);
         printf("  AVX-512 FP64 FMA Peak        : %7.1f GFLOPS\n", out.fma_f64_gflops);
     }
-    if (out.vnni_i8_gops > 0.0)
-        printf("  AVX-512 INT8 VNNI Peak       : %7.1f GOP/s\n", out.vnni_i8_gops);
     return out;
 }
 
@@ -373,11 +337,14 @@ int main(int argc, char **argv) {
         double sec = bench_linear_sec(ctx, dev, d, 128U, 2048U, 2048U, 1U, 5U);
         double rate = ops / sec / 1e9;
         bool int8 = d.x_dtype == VELRI_DTYPE_I8 && d.w_dtype == VELRI_DTYPE_I8;
-        const char *unit = int8 ? "GOP/s" : "GFLOP/s";
-        const char *ref = int8 ? "INT8 VNNI" : (d.y_dtype == VELRI_DTYPE_F64 ? "FP64 FMA" : "FP32 FMA");
-        double ref_peak = (d.y_dtype == VELRI_DTYPE_F64) ? ceil.fma_f64_gflops : ceil.fma_f32_gflops;
-        if (int8) ref_peak = ceil.vnni_i8_gops;
-        printf("%-11s | %7.1f %-7s | ", modes[i].name, rate, unit);
+        if (int8) {
+            printf("%-11s | %7.1f GOP/s   |     n/a | n/a\n", modes[i].name, rate);
+            continue;
+        }
+        bool fp64 = d.y_dtype == VELRI_DTYPE_F64;
+        const char *ref = fp64 ? "FP64 FMA" : "FP32 FMA";
+        double ref_peak = fp64 ? ceil.fma_f64_gflops : ceil.fma_f32_gflops;
+        printf("%-11s | %7.1f GFLOP/s | ", modes[i].name, rate);
         if (ref_peak > 0.0) {
             printf("%6.1f%% | %s\n", 100.0 * rate / ref_peak, ref);
         } else {

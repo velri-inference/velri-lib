@@ -74,11 +74,24 @@ typedef struct {
 
 velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
                                 const velri_plan_options *opts, velri_plan **out_plan);
+enum {
+    /* Pack dedicated immutable host matrices at bind time where the backend supports it. */
+    VELRI_PLAN_PACK_CPU_WEIGHTS = 1U
+};
+
+/* Existing prepare() uses flags=0. Shared plans inherit the owner's weight layout. */
+velri_status velri_plan_prepare_ex(velri_context *ctx, const velri_graph *graph,
+                                   const velri_plan_options *opts, uint32_t flags,
+                                   velri_plan **out_plan);
 void velri_plan_destroy(velri_plan *plan);
 
 /* Bind immutable host weight data ONCE on the plan (shared read-only across all slots). */
 velri_status velri_plan_bind_weight_host(velri_plan *plan, velri_storage_id storage_id,
                                          const void *host_ptr, size_t byte_size);
+
+/* For a packed storage, bind_weight_host copies the entire logical matrix and the caller
+ * may release the source after a successful bind. Unpacked CPU weights are borrowed. */
+bool velri_plan_weight_is_packed(const velri_plan *plan, velri_storage_id storage_id);
 
 velri_status velri_plan_memory_report(const velri_plan *plan, velri_memory_report *out_report);
 uint32_t velri_plan_launch_step_count(const velri_plan *plan);
