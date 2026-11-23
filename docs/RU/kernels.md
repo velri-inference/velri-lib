@@ -93,12 +93,12 @@ Slang CPU всегда собирается в составе `VelriLib::velri` 
   - Ключевые приёмы под LLVM:
     - `pack_b` через `IElement::load4F32` + выровненные записи `Ptr<float4>`/`Ptr<double4>` (убирает `vgather`/`vscatter`), плюс zero-copy чтение `A` для нативных `F32`/`F64` (убирает `call memcpy` от `LoopIdiomRecognize`);
     - программный IEEE-754 `ElemF16` (`-DVELRI_SOFT_F16=1`) на базовом профиле без аппаратного F16C/fcvt — полностью устраняет внешние libcall `__extendhfsf2`/`__truncsfhf2` (критично для Windows MSVC и RISC-V `rv64gc`);
-    - точный по модулю $2^{32}$ `W8A8` на микрокернеле `F32` при `KC=128` ($|\sum| \le 2^{21} \ll 2^{24}$);
+    - переносимый W8A8 GEMM на микрокернеле `F32` накапливает точные суммы по модулю $2^{32}$ при `KC=128` ($|\sum| \le 2^{21} \ll 2^{24}$);
     - одноцикловые редукции через `select(v > m, v, m)` (обычные `max()` и `?:` генерируют `vucomiss` и ломают векторизацию; `select` даёт 4-way ZMM `vmaxps`), Radix-4 Stockham ping-pong для FWHT без алиасинга и запись в локальные буферы строго через `Ptr`.
 - **Vulkan (`-target spirv -profile spirv_1_6 -fvk-use-c-layout -O3`):** под C-layout Slang по умолчанию ставит `Aligned 4` на BDA-указатели (`4× LDG.32`), поэтому критичны явные хелперы `OpLoad`/`OpStore Aligned 16` (`LDG.128`/`STG.128`), `ks=0 / BAR / STS.128 + ks=1` перекрытие для однобуферного `CoopMat` (`20 KiB` -> `2 WG/SM`) и `Split-K` (`vk_splitk_reduce`) для малых батчей `F32`.
 - **Оставшиеся ограничения `slang-llvm` `2026.22.1` (фронт доработки CPU-бэкенда Slang):**
   1. **`BFloat16` не поддерживается на LLVM-таргете** (`InternalError: Unsupported type for LLVM target!`) — используется побитовый `ElemBF16` (`uint16_t`), без генерации `vdpbf16ps` (`AVX512_BF16`).
-  2. **`dot4add_i8packed` и целочисленный dot на CPU не опускаются в `vpdpbusd` (`AVX512_VNNI`)** — W8A8 упирается в потолок FP32 FMA (`~4.3 TOPS` на `LLVM_IR -> Clang 21` против `~8.7 TOPS` архивного ручного VNNI-кода на ветке `archive/c23-cpu-legacy`).
+  2. **`dot4add_i8packed` и целочисленный dot на CPU не опускаются в `vpdpbusd` (`AVX512_VNNI`)**. Для W8A8 GEMM на AVX-512 VNNI ядро `w8a8_vnni.slang` вызывает LLVM-интринсик напрямую. Оно упаковывает панели row-major весов во время операции и считает тайл 14×32 с накоплением в INT32. Диспетчер проверяет VNNI отдельно от AVX-512. Путь GEMV обслуживает батчи из 1–3 строк.
   3. **В официальном релизном `libslang-llvm.so` собраны только LLVM-бэкенды `X86` и `AArch64`:** в режиме `OBJECT` (с GCC) таргеты вроде `RISC-V 64` недоступны; для них используется штатный путь `LLVM_IR -> Clang` (см. [riscv64-linux-gnu.cmake](../../cmake/toolchains/riscv64-linux-gnu.cmake)), где Clang сам компилирует `.ll` в `rv64gc` / `rv64gcv` (RVV 1.0).
 
 ### Критерии приёмки новых Slang-кернелов

@@ -92,10 +92,45 @@ static velri_view_id add_view_3d_strided(velri_graph *g, velri_storage_id sid, v
     return id;
 }
 
+typedef enum {
+    LINEAR_RANDOM,
+    LINEAR_F16_MATMUL,
+    LINEAR_W8A8_EXTREMES,
+} linear_fixture;
+
+/* Keep the other rows and columns random. The first two dot products have opposite signs
+ * and both cross the signed 32-bit boundary at K >= 132105. */
+static void prepare_w8a8_extremes(size_t rows, size_t m, size_t k, int8_t *x, size_t xs,
+                                  int8_t *w, size_t ws, float *x_scale, float *w_scale,
+                                  float *bias, float *expected, float *out, size_t ys) {
+    memset(x, INT8_MIN, k);
+    memset(w, INT8_MIN, k);
+    memset(w + ws, INT8_MAX, k);
+    for (size_t c = 0U; c < m; ++c) {
+        w_scale[c] = 1.0f / (float)(1U << (c % 4U));
+        if (bias) bias[c] = (float)((int)c - 3) * 0.25f;
+    }
+    for (size_t r = 0U; r < rows; ++r) {
+        x_scale[r] = 1.0f / (float)(1U << (r % 3U));
+        for (size_t c = 0U; c < m; ++c) {
+            int64_t dot = 0;
+            for (size_t i = 0U; i < k; ++i)
+                dot += (int)x[r * xs + i] * (int)w[c * ws + i];
+            const int32_t wrapped = (int32_t)(uint32_t)dot;
+            expected[r * ys + c] = (float)wrapped * (x_scale[r] * w_scale[c]) +
+                                   (bias ? bias[c] : 0.0f);
+            out[r * ys + c] = NAN;
+        }
+        for (size_t c = m; c < ys; ++c)
+            out[r * ys + c] = expected[r * ys + c] = 1234.5f;
+    }
+}
+
 static void verify_linear_one(velri_context *ctx, velri_device_id dev, const char *dev_tag,
                               const char *label, velri_linear_desc desc, size_t rows, size_t m,
                               size_t k, size_t x_pad, size_t w_pad, size_t y_pad, bool with_bias,
-                              double tol, bool allow_f16_matmul) {
+                              double tol, linear_fixture fixture) {
+    const bool allow_f16_matmul = fixture == LINEAR_F16_MATMUL;
     size_t xs = k + x_pad, ws = k + w_pad, ys = m + y_pad;
     size_t xb = velri_dtype_bytes(desc.x_dtype);
     size_t wb = velri_dtype_bytes(desc.w_dtype);
@@ -128,7 +163,7 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
 
     velri_plan *plan = nullptr;
     velri_status pst = velri_plan_prepare(ctx, g, nullptr, &plan);
-    if (pst == VELRI_ERR_UNSUPPORTED) {
+    if (pst == VELRI_ERR_UNSUPPORTED && fixture != LINEAR_W8A8_EXTREMES) {
         velri_graph_destroy(g);
         return; /* Dtype combo intentionally unsupported on this device (e.g. FP64 on Vulkan) */
     }
@@ -149,7 +184,10 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     if (hxs) velri_test_fill_dtype(VELRI_DTYPE_F32, hxs, rows, &rng, 0.05f);
     if (hws) velri_test_fill_dtype(VELRI_DTYPE_F32, hws, m, &rng, 0.05f);
 
-    ref_linear_run(&desc, rows, m, k, hx, xs, hxs, hw, ws, hws, hbias, hy_ref, ys);
+    if (fixture == LINEAR_W8A8_EXTREMES)
+        prepare_w8a8_extremes(rows, m, k, hx, xs, hw, ws, hxs, hws, hbias, hy_ref, hy, ys);
+    else
+        ref_linear_run(&desc, rows, m, k, hx, xs, hxs, hw, ws, hws, hbias, hy_ref, ys);
 
     CHECK_OK(velri_plan_bind_weight_host(plan, sw, hw, m * ws * wb), "bind w");
     if (with_bias) CHECK_OK(velri_plan_bind_weight_host(plan, sb, hbias, m * yb), "bind bias");
@@ -167,7 +205,8 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     CHECK_OK(velri_slot_run(slot, nullptr, nullptr), label);
     CHECK(velri_slot_last_run_allocs(slot) == 0U, "0 hot-path allocs on linear");
 
-    double err = velri_test_max_abs_diff_2d(desc.y_dtype, hy_ref, hy, rows, m, ys);
+    size_t checked_cols = fixture == LINEAR_W8A8_EXTREMES ? ys : m;
+    double err = velri_test_max_abs_diff_2d(desc.y_dtype, hy_ref, hy, rows, checked_cols, ys);
     if (allow_f16_matmul) {
         velri_fp16 *x16 = xcalloc(rows * xs, sizeof(*x16));
         velri_fp16 *w16 = xcalloc(m * ws, sizeof(*w16));
@@ -639,17 +678,26 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
     if (is_gpu) {
         verify_dynamic_prompt_linear(ctx, dev);
         verify_linear_one(ctx, dev, tag, "mixed GEMM 64 rows", velri_desc_f32(),
-                          64U, 81U, 37U, 3U, 4U, 2U, false, 3e-5, true);
+                          64U, 81U, 37U, 3U, 4U, 2U, false, 3e-5, LINEAR_F16_MATMUL);
         verify_linear_one(ctx, dev, tag, "mixed GEMM 65 rows + bias", velri_desc_f32(),
-                          65U, 97U, 49U, 2U, 5U, 3U, true, 3e-5, true);
+                          65U, 97U, 49U, 2U, 5U, 3U, true, 3e-5, LINEAR_F16_MATMUL);
         verify_linear_one(ctx, dev, tag, "odd short prompt", velri_desc_f32(),
-                          7, 71, 99, 1, 1, 3, true, 2e-4, false);
+                          7, 71, 99, 1, 1, 3, true, 2e-4, LINEAR_RANDOM);
         verify_linear_one(ctx, dev, tag, "odd prompt projection", velri_desc_f32(),
-                          35, 71, 99, 1, 1, 3, true, 2e-4, false);
+                          35, 71, 99, 1, 1, 3, true, 2e-4, LINEAR_RANDOM);
         verify_rms_gated_outputs(ctx, dev, false);
         verify_rms_gated_outputs(ctx, dev, true);
         verify_gemv_residual_outputs(ctx, dev, false);
         verify_gemv_residual_outputs(ctx, dev, true);
+    } else {
+        verify_linear_one(ctx, dev, tag, "W8A8 GEMV signed overflow", velri_desc_w8a8_f32(),
+                          1U, 9U, 132105U, 2U, 4U, 5U, false, 0.0, LINEAR_W8A8_EXTREMES);
+        verify_linear_one(ctx, dev, tag, "W8A8 GEMM signed overflow", velri_desc_w8a8_f32(),
+                          7U, 5U, 132106U, 1U, 5U, 7U, true, 0.0, LINEAR_W8A8_EXTREMES);
+        verify_linear_one(ctx, dev, tag, "W8A8 multi-panel GEMM", velri_desc_w8a8_f32(),
+                          29U, 259U, 2051U, 2U, 6U, 3U, true, 0.0, LINEAR_W8A8_EXTREMES);
+        verify_linear_one(ctx, dev, tag, "W8A8 multi-block GEMM", velri_desc_w8a8_f32(),
+                          281U, 1051U, 68U, 3U, 5U, 7U, false, 0.0, LINEAR_W8A8_EXTREMES);
     }
     /* 1. Linear: all dtypes (incl. FP64 on CPU) + GEMV + GEMM + Split-K + CoopMat 64/128 */
     struct {
@@ -684,17 +732,17 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
         size_t yp = is_gpu ? gpu_shapes[si].yp : cpu_shapes[si].yp;
         for (int b = 0; b <= 1; ++b) {
             verify_linear_one(ctx, dev, tag, "linear_f32", velri_desc_f32(), rows, m, k, xp, wp, yp,
-                              b != 0, 2e-4, false);
+                              b != 0, 2e-4, LINEAR_RANDOM);
             verify_linear_one(ctx, dev, tag, "linear_f64", velri_desc_f64(), rows, m, k, xp, wp, yp,
-                              b != 0, 1e-11, false);
+                              b != 0, 1e-11, LINEAR_RANDOM);
             verify_linear_one(ctx, dev, tag, "linear_f16", velri_desc_f16(VELRI_DTYPE_F32), rows, m,
-                              k, xp, wp, yp, b != 0, 2e-3, false);
+                              k, xp, wp, yp, b != 0, 2e-3, LINEAR_RANDOM);
             verify_linear_one(ctx, dev, tag, "linear_bf16", velri_desc_bf16(VELRI_DTYPE_F32), rows,
-                              m, k, xp, wp, yp, b != 0, 2e-3, false);
+                              m, k, xp, wp, yp, b != 0, 2e-3, LINEAR_RANDOM);
             verify_linear_one(ctx, dev, tag, "linear_f32x_bf16w", velri_desc_f32x_bf16w(), rows, m,
-                              k, xp, wp, yp, b != 0, 2e-4, false);
+                              k, xp, wp, yp, b != 0, 2e-4, LINEAR_RANDOM);
             verify_linear_one(ctx, dev, tag, "linear_w8a8", velri_desc_w8a8_f32(), rows, m, k, xp,
-                              wp, yp, b != 0, 2e-4, false);
+                              wp, yp, b != 0, 2e-4, LINEAR_RANDOM);
         }
     }
 
@@ -2259,7 +2307,7 @@ int main(void) {
     }
     if (velri_context_find_device(vctx, "vulkan", 1U, &vk_dev) == VELRI_OK) {
         verify_linear_one(vctx, vk_dev, "vulkan:1", "first use of secondary device",
-                          velri_desc_f32(), 1U, 4U, 8U, 0U, 0U, 0U, false, 1e-4, false);
+                          velri_desc_f32(), 1U, 4U, 8U, 0U, 0U, 0U, false, 1e-4, LINEAR_RANDOM);
     }
     velri_context_destroy(vctx);
 #endif

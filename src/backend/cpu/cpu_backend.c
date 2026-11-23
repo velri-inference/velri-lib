@@ -100,7 +100,10 @@ typedef void (*slang_attn_fn)(const float *, uint32_t, const float *, uint32_t, 
 SLANG_CPU_KERNELS(DECL_BASE)
 #undef DECL_BASE
 
+typedef typeof(velri_slang_base_linear_w8a8_f32) slang_w8a8_fn;
+
 #if VELRI_X86_VARIANTS
+extern slang_w8a8_fn velri_slang_linear_w8a8_f32_vnni;
 #define DECL_AVX2(NAME, SIG) extern void velri_slang_avx2_##NAME SIG;
 #define DECL_AVX512(NAME, SIG) extern void velri_slang_avx512_##NAME SIG;
 SLANG_CPU_KERNELS(DECL_AVX2)
@@ -143,8 +146,8 @@ static const slang_cpu_vtable *resolve_slang_vt(velri_cpu_variant variant) {
 struct velri_backend_device {
     velri_pool *pool;
     size_t workers;
-    velri_cpu_variant variant;
     const slang_cpu_vtable *vt;
+    slang_w8a8_fn *w8a8_gemm;
     atomic_flag pool_busy;
 };
 
@@ -197,8 +200,13 @@ static velri_status cpu_open_device(uint32_t local_index, const void *cfg,
         }
     }
     dev->workers = nw;
-    dev->variant = velri_cpu_resolve_variant(req_var);
     dev->vt = vt;
+    dev->w8a8_gemm = vt->linear_w8a8_f32;
+#if VELRI_X86_VARIANTS
+    if (vt == &g_vt_avx512 && velri_get_cpu_info()->has_avx512_vnni) {
+        dev->w8a8_gemm = velri_slang_linear_w8a8_f32_vnni;
+    }
+#endif
     atomic_flag_clear(&dev->pool_busy);
 
     if (nw > 1U) {
@@ -316,6 +324,7 @@ static velri_status cpu_query_operation(const velri_backend_device *dev,
 
 typedef struct {
     const slang_cpu_vtable *vt;
+    slang_w8a8_fn *w8a8;
     const velri_resolved_op *op;
     const velri_buffer_binding *in_b;
     const velri_buffer_binding *out_b;
@@ -428,8 +437,8 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
                            bias ? VELRI_EP_FLAG_BIAS : 0U, (double *)y, ys, r0, r1, c0, c1, k);
             break;
         case VELRI_LIN_W8A8_F32:
-            vt->linear_w8a8_f32((const int8_t *)x, xs, (const int8_t *)w, ws, (const float *)bias,
-                                xsc, wsc, flags, (float *)y, ys, r0, r1, c0, c1, k);
+            c->w8a8((const int8_t *)x, xs, (const int8_t *)w, ws, (const float *)bias, xsc, wsc,
+                    flags, (float *)y, ys, r0, r1, c0, c1, k);
             break;
         case VELRI_LIN_UNSUPPORTED:
         default:
@@ -741,6 +750,8 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         if (st != VELRI_OK) {
             return st;
         }
+        ctx.w8a8 = (ctx.active_rows >= CPU_GEMV_ROW_THRESHOLD) ? dev->w8a8_gemm
+                                                               : dev->vt->linear_w8a8_f32;
         work_units = 2U; /* Always parallelize across M or rows */
         break;
 

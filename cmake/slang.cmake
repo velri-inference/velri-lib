@@ -178,26 +178,22 @@ else()
 endif()
 
 # ============================================================================
-# 1. Slang AOT CPU Objects (ONE source compiled per ISA profile)
+# 1. Slang AOT CPU objects
 # ============================================================================
 set(VELRI_SLANG_CPU_ENTRY "${VELRI_SLANG_DIR}/entry_cpu.slang")
 set(VELRI_SLANG_CPU_OBJS)
 
-function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_isa_flags extra_defs)
+function(velri_add_slang_cpu_object isa entry deps llvm_features clang_isa_flags)
     set(_obj "${VELRI_SLANG_GEN_DIR}/slang_cpu_${isa}${_velri_obj_ext}")
+
+    set(_slang_cmd "${VELRI_SLANGC}" "${entry}"
+        -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
+        -fp-mode fast ${ARGN})
 
     if(_velri_use_llvm_ir)
         set(_raw_ll "${VELRI_SLANG_GEN_DIR}/slang_cpu_${isa}.raw.ll")
         set(_clean_ll "${VELRI_SLANG_GEN_DIR}/slang_cpu_${isa}.ll")
-        set(_slang_cmd "${VELRI_SLANGC}" "${VELRI_SLANG_CPU_ENTRY}"
-            -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
-            -target llvm-ir -O0 -fp-mode fast
-            "-DVELRI_ISA=${isa}" "-DVELRI_MR=${mr}"
-            "-DVELRI_NR_F32=${nr_f32}" "-DVELRI_NR_F64=${nr_f64}")
-        foreach(_def IN LISTS extra_defs)
-            list(APPEND _slang_cmd "-D${_def}")
-        endforeach()
-        list(APPEND _slang_cmd -o "${_raw_ll}")
+        list(APPEND _slang_cmd -target llvm-ir -O0 -o "${_raw_ll}")
 
         if(VELRI_MSVC_FRONTEND)
             set(_cc_cmd "${CMAKE_C_COMPILER}" ${_velri_clang_target_flags} ${clang_isa_flags}
@@ -217,31 +213,23 @@ function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_is
                 "-DOUTPUT_LL=${_clean_ll}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/strip_ll_target.cmake"
             COMMAND ${_cc_cmd}
-            DEPENDS "${VELRI_SLANG_CPU_ENTRY}" ${VELRI_SLANG_CPU_DEPS}
+            DEPENDS "${entry}" ${deps}
                     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/strip_ll_target.cmake"
-            COMMENT "Slang AOT CPU (${isa}, LLVM IR -> Clang): entry_cpu.slang -> slang_cpu_${isa}${_velri_obj_ext}"
+            COMMENT "Slang AOT CPU (${isa}, LLVM IR -> Clang): slang_cpu_${isa}${_velri_obj_ext}"
             VERBATIM
         )
     else()
-        set(_cmd "${VELRI_SLANGC}" "${VELRI_SLANG_CPU_ENTRY}"
-            -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
-            -target host-object-code -O3 -fp-mode fast
-            -llvm-target-triple "${_velri_triple}"
-            "-DVELRI_ISA=${isa}" "-DVELRI_MR=${mr}"
-            "-DVELRI_NR_F32=${nr_f32}" "-DVELRI_NR_F64=${nr_f64}")
-        foreach(_def IN LISTS extra_defs)
-            list(APPEND _cmd "-D${_def}")
-        endforeach()
+        list(APPEND _slang_cmd -target host-object-code -O3 -llvm-target-triple "${_velri_triple}")
         if(llvm_features)
-            list(APPEND _cmd -llvm-features "${llvm_features}")
+            list(APPEND _slang_cmd -llvm-features "${llvm_features}")
         endif()
-        list(APPEND _cmd -o "${_obj}")
+        list(APPEND _slang_cmd -o "${_obj}")
 
         add_custom_command(
             OUTPUT "${_obj}"
-            COMMAND ${_cmd}
-            DEPENDS "${VELRI_SLANG_CPU_ENTRY}" ${VELRI_SLANG_CPU_DEPS}
-            COMMENT "Slang AOT CPU (${isa}, ${_velri_triple}): entry_cpu.slang -> slang_cpu_${isa}${_velri_obj_ext}"
+            COMMAND ${_slang_cmd}
+            DEPENDS "${entry}" ${deps}
+            COMMENT "Slang AOT CPU (${isa}, ${_velri_triple}): slang_cpu_${isa}${_velri_obj_ext}"
             VERBATIM
         )
     endif()
@@ -250,28 +238,41 @@ function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_is
     set(VELRI_SLANG_CPU_OBJS ${VELRI_SLANG_CPU_OBJS} "${_obj}" PARENT_SCOPE)
 endfunction()
 
+function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_isa_flags)
+    velri_add_slang_cpu_object(${isa} "${VELRI_SLANG_CPU_ENTRY}" "${VELRI_SLANG_CPU_DEPS}"
+        "${llvm_features}" "${clang_isa_flags}" -DVELRI_ISA=${isa} -DVELRI_MR=${mr}
+        -DVELRI_NR_F32=${nr_f32} -DVELRI_NR_F64=${nr_f64} ${ARGN})
+    set(VELRI_SLANG_CPU_OBJS ${VELRI_SLANG_CPU_OBJS} PARENT_SCOPE)
+endfunction()
+
 set(_velri_base_mr 3)
-set(_velri_base_defs "VELRI_SOFT_F16=1")
+set(_velri_base_defs "-DVELRI_SOFT_F16=1")
 if(VELRI_TARGET_AARCH64)
     set(_velri_base_mr 4)
     set(_velri_base_defs "")
 endif()
-velri_add_slang_cpu_variant(base ${_velri_base_mr} 16 8 "" "${VELRI_BASE_FLAGS}" "${_velri_base_defs}")
+
+velri_add_slang_cpu_variant(base ${_velri_base_mr} 16 8 "" "${VELRI_BASE_FLAGS}" ${_velri_base_defs})
 
 if(VELRI_X86_VARIANTS)
     if(VELRI_MSVC_FRONTEND)
         set(_avx2_cc_flags /arch:AVX2)
         set(_avx512_cc_flags /arch:AVX512)
+        set(_vnni_flag /clang:-mavx512vnni)
     else()
         set(_avx2_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mfma -mf16c)
         set(_avx512_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -mf16c)
+        set(_vnni_flag -mavx512vnni)
     endif()
     velri_add_slang_cpu_variant(avx2 3 32 16
         "+avx2,+fma,+f16c"
-        "${_avx2_cc_flags}" "")
-    velri_add_slang_cpu_variant(avx512 6 64 32
-        "+avx2,+avx512f,+avx512bw,+avx512dq,+avx512vl,+fma,+f16c"
-        "${_avx512_cc_flags}" "")
+        "${_avx2_cc_flags}")
+    set(_avx512_features "+avx2,+avx512f,+avx512bw,+avx512dq,+avx512vl,+fma,+f16c")
+    velri_add_slang_cpu_variant(avx512 6 64 32 "${_avx512_features}"
+        "${_avx512_cc_flags}")
+    velri_add_slang_cpu_object(w8a8_vnni "${VELRI_SLANG_DIR}/w8a8_vnni.slang"
+        "${VELRI_SLANG_COMMON_DEPS}" "${_avx512_features},+avx512vnni"
+        "${_avx512_cc_flags};${_vnni_flag}")
 endif()
 
 # ============================================================================
