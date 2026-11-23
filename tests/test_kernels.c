@@ -250,6 +250,53 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     free(hx); free(hw); free(hy_ref); free(hy); free(hbias); free(hxs); free(hws);
 }
 
+static void verify_scalar_w8a8_scale_binding(velri_context *ctx, velri_device_id dev) {
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "scalar W8A8 graph");
+    velri_storage_id x = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_I8, 1, dev);
+    velri_storage_id w = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_I8, 1, dev);
+    velri_storage_id xs = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, 1, dev);
+    velri_storage_id ws = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, 1, dev);
+    velri_storage_id y = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, 1, dev);
+    velri_op_desc op = {
+        .kind = VELRI_OP_LINEAR, .num_inputs = 5, .num_outputs = 1,
+        .inputs = {add_view_2d_strided(g, x, VELRI_DTYPE_I8, 1, 1, 1),
+                   add_view_2d_strided(g, w, VELRI_DTYPE_I8, 1, 1, 1), VELRI_INVALID_ID,
+                   add_view_1d(g, xs, VELRI_DTYPE_F32, 1, 0),
+                   add_view_1d(g, ws, VELRI_DTYPE_F32, 1, 0)},
+        .outputs = {add_view_2d_strided(g, y, VELRI_DTYPE_F32, 1, 1, 1)},
+        .attr.linear.desc = velri_desc_w8a8_f32(),
+    };
+    CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "scalar W8A8 op");
+    int8_t input = 2, weight = 3;
+    for (unsigned packed = 0; packed < 2; ++packed) {
+        velri_plan *plan = nullptr;
+        uint32_t flags = packed ? VELRI_PLAN_PACK_CPU_WEIGHTS : 0;
+        CHECK_OK(velri_plan_prepare_ex(ctx, g, nullptr, flags, &plan), "scalar W8A8 plan");
+        CHECK_OK(velri_plan_bind_weight_host(plan, w, &weight, sizeof(weight)), "scalar weight");
+        CHECK(velri_plan_weight_is_packed(plan, w) == (packed != 0), "scalar weight layout");
+        velri_slot *slot = nullptr;
+        CHECK_OK(velri_slot_create(plan, &slot), "scalar W8A8 slot");
+        CHECK_OK(velri_slot_bind_host(slot, x, &input, sizeof(input)), "scalar input");
+        /* Both scales are ordinary slot inputs. Each is read once when producing one output. */
+        float row_scale, col_scale, output;
+        float *destinations[] = {&output, &row_scale, &col_scale};
+        CHECK_OK(velri_slot_bind_host(slot, xs, &row_scale, sizeof(row_scale)), "scalar row scale");
+        CHECK_OK(velri_slot_bind_host(slot, ws, &col_scale, sizeof(col_scale)), "scalar column scale");
+        for (size_t i = 0; i < sizeof(destinations) / sizeof(*destinations); ++i) {
+            row_scale = 4.0f;
+            col_scale = 5.0f;
+            output = -1.0f;
+            CHECK_OK(velri_slot_bind_host(slot, y, destinations[i], sizeof(output)), "scalar output");
+            CHECK_OK(velri_slot_run(slot, nullptr, nullptr), "scalar W8A8 run");
+            CHECK(*destinations[i] == 120.0f, "single W8A8 output must use both input scales");
+        }
+        velri_slot_destroy(slot);
+        velri_plan_destroy(plan);
+    }
+    velri_graph_destroy(g);
+}
+
 static void verify_w8a8_weight_packing(velri_context *ctx, velri_device_id dev,
                                       velri_cpu_variant variant) {
     enum { rows = 29, m = 131, k = 2051, xs = k + 2, ws = k + 4, ys = m + 6 };
@@ -2401,6 +2448,7 @@ int main(void) {
         velri_device_id cpu_dev = 0U;
         CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &cpu_dev), "find cpu");
         verify_all_ops_on_device(ctx, cpu_dev, vnames[vi], false);
+        verify_scalar_w8a8_scale_binding(ctx, cpu_dev);
         verify_w8a8_weight_packing(ctx, cpu_dev, vars[vi]);
         verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 joined panels and tails",
                           velri_desc_w8a8_f32(), 17U, 1031U, 259U, 3U, 5U, 7U, true,
