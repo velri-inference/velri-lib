@@ -14,7 +14,7 @@ endif()
 option(VELRI_LIB_BUILD_TESTS "Build Velri-lib's correctness and contract test suites" ${VELRI_LIB_TESTS_DEFAULT})
 option(VELRI_BUILD_BENCHMARKS "Build CPU and Vulkan roofline benchmark tools" OFF)
 option(VELRI_CPU_MULTIVERSION "Build x86-64 AVX2 and AVX-512 AOT variants from the single Slang source" ON)
-option(VELRI_SLANG_CPU_DOT "Use a compatible native G++ for Slang W8A8 byte-dot kernels on Linux x86-64" ON)
+option(VELRI_SLANG_CPU_DOT "Probe native compilers for Slang W8A8 byte-dot kernels on Linux x86-64" ON)
 option(VELRI_SANITIZE "Enable address and undefined-behavior sanitizers" OFF)
 option(VELRI_ENABLE_VULKAN "Build Slang AOT Vulkan backend (SPIR-V 1.6)" OFF)
 
