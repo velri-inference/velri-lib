@@ -4,6 +4,7 @@ import epilogue;
 
 static const uint kDirectOrder = 8u;
 static const uint kRowBlock = 64;
+static const uint kOperandBudget = 32u * 1024u;
 static const int kTilesPerPanel = 8;
 static const int kPackedTileCols = 6;
 static const int kTileRows = 4;
@@ -122,9 +123,17 @@ void dot_slice<let PACKED : bool, let TILE_COLS : int>(
     uint width = c1 - c0;
     bool direct = direct_order || r1 - r0 < uint(kTileRows) || width < uint(kTileCols) ||
                   ys < width || k == 0u;
-    // A short block keeps eight activation rows and one weight tile within 32 KiB.
-    uint row_block = !direct && k <= 32768u / uint(2 * kTileRows + TILE_COLS)
-                   ? uint(2 * kTileRows) : kRowBlock;
+    // Size the activation block and one weight tile to a 32 KiB operand budget.
+    uint row_block = kRowBlock;
+    if (!direct && k <= kOperandBudget / uint(2 * kTileRows + TILE_COLS)) {
+        if (k <= kOperandBudget / uint(8 * kTileRows + TILE_COLS)) {
+            row_block = uint(8 * kTileRows);
+        } else if (k <= kOperandBudget / uint(4 * kTileRows + TILE_COLS)) {
+            row_block = uint(4 * kTileRows);
+        } else {
+            row_block = uint(2 * kTileRows);
+        }
+    }
     for (uint rb = r0; rb < r1;) {
         uint height = min(row_block, r1 - rb);
         Ptr<int8_t, Access.Read> xb = x + uint64_t(rb) * xs;
