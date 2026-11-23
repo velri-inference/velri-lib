@@ -90,7 +90,7 @@ typedef struct {
 
 typedef struct {
     const velri_prepared_op *packed_weight_op; /* Static backend descriptor for native weight operands. */
-    bool (*describe_weight)(const velri_resolved_op *op,
+    bool (*describe_weight)(const velri_backend_device *dev, const velri_resolved_op *op,
                             uint32_t input, velri_weight_packing *out);
     void (*pack_weight)(const velri_backend_device *dev, const velri_weight_packing *packing,
                         const void *source, void *dst);

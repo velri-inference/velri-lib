@@ -137,6 +137,7 @@ static const slang_cpu_vtable g_vt_avx512 = {SLANG_CPU_KERNELS(INIT_AVX512)};
 #define DECL_DOT(NAME, SIG) extern void velri_slang_dot_##NAME SIG;
 #define INIT_DOT(NAME, SIG) .NAME = velri_slang_dot_##NAME,
 SLANG_CPU_W8A8_KERNELS(DECL_DOT)
+extern uint32_t velri_slang_dot_packed_stride(uint32_t depth);
 static const slang_cpu_vtable g_vt_avx512_dot = {
     SLANG_CPU_COMMON_KERNELS(INIT_AVX512) SLANG_CPU_W8A8_KERNELS(INIT_DOT)
 };
@@ -336,7 +337,7 @@ enum { W8A8_PANEL_WIDTH = 32 };
 struct velri_prepared_op { bool packed_w8a8; };
 static const velri_prepared_op cpu_packed_w8a8 = {.packed_w8a8 = true};
 
-static bool cpu_describe_weight(const velri_resolved_op *op,
+static bool cpu_describe_weight(const velri_backend_device *dev, const velri_resolved_op *op,
                                 uint32_t input, velri_weight_packing *out) {
     if (op->kind != VELRI_OP_LINEAR || input != 1 ||
         velri_linear_classify(&op->raw.attr.linear.desc) != VELRI_LIN_W8A8_F32)
@@ -348,6 +349,16 @@ static bool cpu_describe_weight(const velri_resolved_op *op,
         velri_align_up_overflow(w->dims[0], W8A8_PANEL_WIDTH, &channels) ||
         velri_mul_overflow_size(channels, w->dims[1], &out->bytes))
         return false;
+#if VELRI_HAS_SLANG_CPU_DOT
+    if (dev->vt == &g_vt_avx512_dot) {
+        size_t native_bytes;
+        if (velri_mul_overflow_size(w->dims[0], velri_slang_dot_packed_stride((uint32_t)w->dims[1]),
+                                    &native_bytes)) return false;
+        if (native_bytes > out->bytes) out->bytes = native_bytes;
+    }
+#else
+    (void)dev;
+#endif
     out->channels = (uint32_t)w->dims[0];
     out->depth = (uint32_t)w->dims[1];
     out->stride = (uint32_t)w->strides[0];
@@ -830,7 +841,7 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         ctx.packed_w8a8 = item->prepared == &cpu_packed_w8a8;
         velri_weight_packing packing = {0};
         if (ctx.packed_w8a8 &&
-            (!cpu_describe_weight(op, 1U, &packing) ||
+            (!cpu_describe_weight(dev, op, 1U, &packing) ||
              !velri_binding_range_valid(&item->inputs[1], packing.bytes)))
             return VELRI_ERR_INVALID;
 #if VELRI_HAS_SLANG_CPU_DOT

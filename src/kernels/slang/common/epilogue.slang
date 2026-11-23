@@ -46,12 +46,15 @@ public struct EpBias : IEpilogue {
 
 // Quantized scale epilogue: supports both W8A32 (w_scale) and W8A8 (x_scale * w_scale) + bias.
 public struct EpQuantScale : IEpilogue {
+    [ForceInline] public static float apply_scales(float acc, float w_scale, float x_scale) {
+        return acc * (w_scale * x_scale);
+    }
+
     public static float apply(float acc, uint row, uint col, EpilogueParams ep) {
         float s = 1.0f;
         if (ep.has_w_scale != 0u) s *= ep.w_scale[col];
-        if (ep.has_x_scale != 0u) s *= ep.x_scale[row];
-        acc *= s;
-        if (ep.has_bias != 0u) acc += ep.bias[col];
-        return acc;
+        if (ep.has_x_scale != 0u) acc = apply_scales(acc, s, ep.x_scale[row]);
+        else acc *= s;
+        return EpBias::apply(acc, row, col, ep);
     }
 }

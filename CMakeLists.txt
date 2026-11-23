@@ -193,8 +193,10 @@ endif()
 
 # Correctness & Contract Test Suites
 if(VELRI_LIB_BUILD_TESTS)
-    add_executable(test_kernels tests/test_kernels.c)
-    target_compile_definitions(test_kernels PRIVATE VELRI_X86_VARIANTS=${VELRI_X86_VARIANTS})
+    add_executable(test_kernels tests/test_kernels.c tests/cpu/guard_buffer.c)
+    target_compile_definitions(test_kernels PRIVATE
+        VELRI_X86_VARIANTS=${VELRI_X86_VARIANTS}
+        VELRI_HAS_SLANG_CPU_DOT=${VELRI_HAS_SLANG_CPU_DOT})
     if(VELRI_ENABLE_VULKAN)
         target_compile_definitions(test_kernels PRIVATE VELRI_CORE_HAS_VULKAN=1)
     endif()

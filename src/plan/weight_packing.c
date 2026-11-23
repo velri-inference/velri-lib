@@ -26,7 +26,7 @@ static void inspect_uses(velri_plan *plan, weight_use *uses) {
             if (ps->kind != VELRI_STORAGE_WEIGHT) continue;
             velri_weight_packing candidate = {0};
             if (ps->device_id != step->u.op.device_id || !de->hooks || !de->hooks->describe_weight ||
-                !de->hooks->describe_weight(op, i, &candidate) ||
+                !de->hooks->describe_weight(de->dev, op, i, &candidate) ||
                 (uses[sid] == PACKABLE && !same_packing(&candidate, &ps->packing))) {
                 uses[sid] = NEEDS_RAW;
             } else {

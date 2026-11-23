@@ -1,4 +1,5 @@
 #include "reference.h"
+#include "cpu/guard_buffer.h"
 #include "velri_lib/velri_lib.h"
 #include <math.h>
 #include <stdio.h>
@@ -175,7 +176,8 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     }
     CHECK_OK(pst, label);
 
-    void *hx = xcalloc(rows * xs, xb);
+    guard_buffer x_buffer = guard_buffer_alloc(rows * xs * xb, pack && !x_pad ? GUARD_AFTER : GUARD_NONE);
+    void *hx = x_buffer.data;
     void *hw = xcalloc(m * ws, wb);
     void *hy_ref = xcalloc(rows * ys, yb);
     void *hy = xcalloc(rows * ys, yb);
@@ -247,7 +249,7 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     velri_slot_destroy(slot);
     velri_plan_destroy(plan);
     velri_graph_destroy(g);
-    free(hx); free(hw); free(hy_ref); free(hy); free(hbias); free(hxs); free(hws);
+    guard_buffer_free(x_buffer); free(hw); free(hy_ref); free(hy); free(hbias); free(hxs); free(hws);
 }
 
 static void verify_scalar_w8a8_scale_binding(velri_context *ctx, velri_device_id dev) {
@@ -299,7 +301,7 @@ static void verify_scalar_w8a8_scale_binding(velri_context *ctx, velri_device_id
 
 static void verify_w8a8_weight_packing(velri_context *ctx, velri_device_id dev,
                                       velri_cpu_variant variant) {
-    enum { rows = 29, m = 131, k = 2051, xs = k + 2, ws = k + 4, ys = m + 6 };
+    enum { rows = 29, m = 127, k = 2049, xs = k, ws = k + 4, ys = m + 6 };
     velri_graph *g = nullptr;
     CHECK_OK(velri_graph_create(&g), "packed W8A8 graph");
     velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_I8, rows * xs, dev);
@@ -335,7 +337,8 @@ static void verify_w8a8_weight_packing(velri_context *ctx, velri_device_id dev,
     velri_slot *slot = nullptr;
     CHECK_OK(velri_slot_create(peer, &slot), "packed W8A8 slot");
 
-    int8_t *x = xcalloc(rows * xs, sizeof(*x));
+    guard_buffer x_buffer = guard_buffer_alloc(rows * xs, GUARD_AFTER);
+    int8_t *x = x_buffer.data;
     float *expected = xcalloc(rows * ys, sizeof(*expected)), *y = xcalloc(rows * ys, sizeof(*y));
     float x_scale[rows], w_scale[m], bias[m];
     uint64_t rng = 0xF8A80001U;
@@ -348,6 +351,19 @@ static void verify_w8a8_weight_packing(velri_context *ctx, velri_device_id dev,
         int8_t *w = weights[bind];
         velri_test_fill_dtype(VELRI_DTYPE_I8, w, m * ws, &rng, 1.0f);
         prepare_w8a8_extremes(rows, m, k, x, xs, w, ws, x_scale, w_scale, bias, expected, y, ys);
+        velri_memory_report rep;
+        CHECK_OK(velri_plan_memory_report(plan, &rep), "W8A8 memory report");
+        size_t packed_m = (m + 31U) / 32U * 32U;
+        size_t matrix_bytes = packed_m * k;
+#if VELRI_HAS_SLANG_CPU_DOT
+        /* 127 native rows at 2,112 bytes exceed even a page-aligned allocation of 128 × 2,049. */
+        if (variant == VELRI_CPU_AVX512 && velri_get_cpu_info()->has_avx512_vnni)
+            matrix_bytes = (size_t)m * 2112U;
+#endif
+        size_t padding = (w_align - matrix_bytes % w_align) % w_align;
+        CHECK(rep.devices[dev].weight_bytes == matrix_bytes + sizeof(w_scale) + sizeof(bias) &&
+              rep.devices[dev].allocator_overhead_bytes == padding,
+              "CPU memory report counts one native matrix and its allocation padding");
         CHECK_OK(velri_plan_bind_weight_host(plan, sw, w, m * ws), "bind or replace W8A8 weights");
         CHECK_OK(velri_plan_bind_weight_host(plan, sws, w_scale, sizeof(w_scale)), "W8A8 w scale");
         CHECK_OK(velri_plan_bind_weight_host(plan, sb, bias, sizeof(bias)), "W8A8 bias");
@@ -357,16 +373,7 @@ static void verify_w8a8_weight_packing(velri_context *ctx, velri_device_id dev,
         CHECK(velri_plan_bind_weight_host(plan, sw, w, m * ws - 1U) == VELRI_ERR_INVALID,
               "undersized W8A8 rebind rejected");
 
-        velri_memory_report rep;
-        CHECK_OK(velri_plan_memory_report(plan, &rep), "W8A8 memory report");
-        size_t packed_m = (m + 31U) / 32U * 32U;
-        size_t matrix_bytes = packed_m * k;
-        size_t padding = (w_align - matrix_bytes % w_align) % w_align;
-        CHECK(rep.devices[dev].weight_bytes == matrix_bytes + sizeof(w_scale) + sizeof(bias) &&
-              rep.devices[dev].allocator_overhead_bytes == padding,
-              "CPU memory report counts one native matrix and its allocation padding");
-
-        const size_t active[] = {1U, 2U, 3U, rows};
+        const size_t active[] = {1U, 2U, 3U, 4U, 8U, rows};
         for (size_t i = 0U; i < sizeof(active) / sizeof(active[0]); ++i) {
             const float untouched = -1234.5f;
             for (size_t j = 0; j < rows * ys; ++j) y[j] = untouched;
@@ -402,7 +409,7 @@ static void verify_w8a8_weight_packing(velri_context *ctx, velri_device_id dev,
     velri_slot_destroy(slot);
     velri_plan_destroy(plan);
     velri_graph_destroy(g);
-    free(weights[0]); free(weights[1]); free(x); free(y); free(expected);
+    free(weights[0]); free(weights[1]); guard_buffer_free(x_buffer); free(y); free(expected);
 }
 
 // The mixed kernel receives original F32 projections. Round only the reference K/V
@@ -2450,6 +2457,9 @@ int main(void) {
         verify_all_ops_on_device(ctx, cpu_dev, vnames[vi], false);
         verify_scalar_w8a8_scale_binding(ctx, cpu_dev);
         verify_w8a8_weight_packing(ctx, cpu_dev, vars[vi]);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 guarded final tile",
+                          velri_desc_w8a8_f32(), 8U, 101U, 125U, 0U, 3U, 5U, false,
+                          0.0, LINEAR_PACKED_W8A8_EXTREMES);
         verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 joined panels and tails",
                           velri_desc_w8a8_f32(), 17U, 1031U, 259U, 3U, 5U, 7U, true,
                           0.0, LINEAR_PACKED_W8A8_EXTREMES);
