@@ -2402,6 +2402,9 @@ int main(void) {
         CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &cpu_dev), "find cpu");
         verify_all_ops_on_device(ctx, cpu_dev, vnames[vi], false);
         verify_w8a8_weight_packing(ctx, cpu_dev, vars[vi]);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 joined panels and tails",
+                          velri_desc_w8a8_f32(), 17U, 1031U, 259U, 3U, 5U, 7U, true,
+                          0.0, LINEAR_PACKED_W8A8_EXTREMES);
         verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 GEMV signed overflow",
                           velri_desc_w8a8_f32(), 3U, 9U, 132105U, 2U, 4U, 5U, false,
                           0.0, LINEAR_PACKED_W8A8_EXTREMES);

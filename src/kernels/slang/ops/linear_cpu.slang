@@ -421,19 +421,32 @@ void w8a8_gemv_columns<let PACKED : bool, let COLS : int>(
         y[col + j] = EpQuantScale::apply(float(int32_t(sums[j])), row, col + j, ep);
 }
 
-void unpack_w8a8_panel<let NR : int>(Ptr<int8_t, Access.Read> src, uint width,
-                                     uint depth, Ptr<float> dst)
+// Gather adjacent 32-channel storage panels into one NR-column compute tile.
+void unpack_w8a8_panel<let NR : int>(
+    Ptr<int8_t, Access.Read> weights, uint stride, uint col, uint width,
+    uint k0, uint depth, Ptr<float> dst)
 {
-    for (uint p = 0; p < depth; ++p) {
-        uint j = 0;
-        for (; j + 4 <= width; j += 4) {
-            float4 v = ElemI8::load4F32(src + j);
-            [ForceUnroll] for (uint i = 0; i < 4; ++i) dst[j + i] = v[i];
+    for (uint j = 0; j < width;) {
+        uint c = col + j;
+        uint span = min(width - j, kW8A8PanelWidth - c % kW8A8PanelWidth);
+        Ptr<int8_t, Access.Read> src = w8a8_column<true>(weights, stride, c)
+                                    + uint64_t(k0) * kW8A8PanelWidth;
+        Ptr<float> outp = dst + j;
+        for (uint p = 0; p < depth; ++p) {
+            uint i = 0;
+            for (; i + 4 <= span; i += 4) {
+                float4 v = ElemI8::load4F32(src + i);
+                [ForceUnroll] for (uint lane = 0; lane < 4; ++lane) outp[i + lane] = v[lane];
+            }
+            for (; i < span; ++i) outp[i] = ElemI8::toF32(src[i]);
+            src = src + kW8A8PanelWidth;
+            outp = outp + NR;
         }
-        for (; j < width; ++j) dst[j] = ElemI8::toF32(src[j]);
-        for (; j < uint(NR); ++j) dst[j] = 0.0f;
-        src = src + kW8A8PanelWidth;
-        dst = dst + NR;
+        j += span;
+    }
+    if (width < uint(NR)) {
+        for (uint p = 0; p < depth; ++p)
+            for (uint j = width; j < uint(NR); ++j) dst[p * uint(NR) + j] = 0.0f;
     }
 }
 
@@ -468,14 +481,12 @@ public void linear_w8a8_f32_slice_cpu<let MR : int, let NR : int, let PACKED : b
 
     for (uint cb = c0; cb < c1;) {
         uint nr = min(uint(NR), c1 - cb);
-        if (PACKED) nr = min(nr, kW8A8PanelWidth - cb % kW8A8PanelWidth);
         for (uint rb = r0; rb < r1;) {
             uint mc = min(kMC, r1 - rb);
             for (uint k0 = 0; k0 < k;) {
                 uint kc = min(kKC, k - k0);
                 if (PACKED) {
-                    Ptr<int8_t, Access.Read> panel = w8a8_column<true>(w, w_stride, cb);
-                    unpack_w8a8_panel<NR>(panel + uint64_t(k0) * kW8A8PanelWidth, nr, kc, bp);
+                    unpack_w8a8_panel<NR>(w, w_stride, cb, nr, k0, kc, bp);
                 } else {
                     pack_b_f32<ElemI8, NR>(w, w_stride, cb, nr, k0, kc, &bp4[0]);
                 }
