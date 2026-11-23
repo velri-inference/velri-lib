@@ -28,7 +28,16 @@ enum {
     CPU_KV_APPEND_PARALLEL_MIN = 4096U
 };
 
-#define SLANG_CPU_KERNELS(X)                                                                       \
+#define SLANG_CPU_W8A8_KERNELS(X)                                                                  \
+    X(linear_w8a8_f32, (const int8_t *, uint32_t, const int8_t *, uint32_t, const float *,         \
+                        const float *, const float *, uint32_t, float *, uint32_t, uint32_t,       \
+                        uint32_t, uint32_t, uint32_t, uint32_t))                                   \
+    X(linear_w8a8_f32_packed, (const int8_t *, uint32_t, const int8_t *, const float *,            \
+                               const float *, const float *, uint32_t, float *, uint32_t,          \
+                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))                  \
+    X(pack_w8a8, (const int8_t *, uint32_t, uint32_t, uint32_t, int8_t *))
+
+#define SLANG_CPU_COMMON_KERNELS(X)                                                                \
     X(linear_f32, (const float *, uint32_t, const float *, uint32_t, const float *, uint32_t,      \
                    float *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))           \
     X(linear_f16_f32, (const uint16_t *, uint32_t, const uint16_t *, uint32_t, const float *,      \
@@ -42,13 +51,6 @@ enum {
                           uint32_t))                                                               \
     X(linear_f64, (const double *, uint32_t, const double *, uint32_t, const double *, uint32_t,   \
                    double *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))          \
-    X(linear_w8a8_f32, (const int8_t *, uint32_t, const int8_t *, uint32_t, const float *,         \
-                        const float *, const float *, uint32_t, float *, uint32_t, uint32_t,       \
-                        uint32_t, uint32_t, uint32_t, uint32_t))                                   \
-    X(linear_w8a8_f32_packed, (const int8_t *, uint32_t, const int8_t *, const float *,            \
-                               const float *, const float *, uint32_t, float *, uint32_t,          \
-                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))                  \
-    X(pack_w8a8, (const int8_t *, uint32_t, uint32_t, uint32_t, int8_t *))                         \
     X(rmsnorm_f32, (const float *, uint32_t, const float *, uint32_t, float *, uint32_t, uint32_t, \
                     uint32_t, uint32_t, float, uint32_t))                                          \
     X(rmsnorm_bf16, (const uint16_t *, uint32_t, const uint16_t *, uint32_t, uint16_t *, uint32_t, \
@@ -95,6 +97,8 @@ enum {
                            uint32_t, float *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,    \
                            uint32_t, uint32_t, uint32_t))
 
+#define SLANG_CPU_KERNELS(X) SLANG_CPU_COMMON_KERNELS(X) SLANG_CPU_W8A8_KERNELS(X)
+
 typedef void (*slang_attn_fn)(const float *, uint32_t, const float *, uint32_t, uint32_t,
                               const float *, uint32_t, uint32_t, float *, uint32_t, uint32_t,
                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
@@ -128,6 +132,16 @@ static const slang_cpu_vtable g_vt_base = {SLANG_CPU_KERNELS(INIT_BASE)};
 #define INIT_AVX512(NAME, SIG) .NAME = velri_slang_avx512_##NAME,
 static const slang_cpu_vtable g_vt_avx2 = {SLANG_CPU_KERNELS(INIT_AVX2)};
 static const slang_cpu_vtable g_vt_avx512 = {SLANG_CPU_KERNELS(INIT_AVX512)};
+#if VELRI_HAS_SLANG_CPU_DOT
+#define DECL_DOT(NAME, SIG) extern void velri_slang_dot_##NAME SIG;
+#define INIT_DOT(NAME, SIG) .NAME = velri_slang_dot_##NAME,
+SLANG_CPU_W8A8_KERNELS(DECL_DOT)
+static const slang_cpu_vtable g_vt_avx512_dot = {
+    SLANG_CPU_COMMON_KERNELS(INIT_AVX512) SLANG_CPU_W8A8_KERNELS(INIT_DOT)
+};
+#undef DECL_DOT
+#undef INIT_DOT
+#endif
 #undef INIT_AVX2
 #undef INIT_AVX512
 #endif
@@ -138,6 +152,9 @@ static const slang_cpu_vtable *resolve_slang_vt(velri_cpu_variant variant) {
     }
     velri_cpu_variant r = velri_cpu_resolve_variant(variant);
 #if VELRI_X86_VARIANTS
+#if VELRI_HAS_SLANG_CPU_DOT
+    if (r == VELRI_CPU_AVX512 && velri_get_cpu_info()->has_avx512_vnni) return &g_vt_avx512_dot;
+#endif
     if (r == VELRI_CPU_AVX512) return &g_vt_avx512;
     if (r == VELRI_CPU_AVX2) return &g_vt_avx2;
 #endif

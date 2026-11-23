@@ -391,34 +391,56 @@ public void pack_w8a8_cpu(Ptr<int8_t, Access.Read> w, uint stride,
     }
 }
 
-Ptr<int8_t, Access.Read> w8a8_column<let PACKED : bool>(
-    Ptr<int8_t, Access.Read> w, uint stride, uint col)
-{
-    if (PACKED) {
-        uint lane = col % kW8A8PanelWidth;
-        return w + uint64_t(col - lane) * stride + lane;
-    }
-    return w + uint64_t(col) * stride;
-}
-
-void w8a8_gemv_columns<let PACKED : bool, let COLS : int>(
+void w8a8_gemv_columns<let COLS : int>(
     Ptr<int8_t, Access.Read> x, Ptr<int8_t, Access.Read> w, uint stride,
     Ptr<float> y, uint row, uint col, uint k, EpilogueParams ep)
 {
     Ptr<int8_t, Access.Read> columns[COLS];
     uint sums[COLS];
     [ForceUnroll] for (uint j = 0; j < uint(COLS); ++j) {
-        columns[j] = w8a8_column<PACKED>(w, stride, col + j);
+        columns[j] = w + uint64_t(col + j) * stride;
         sums[j] = 0;
     }
     for (uint i = 0; i < k; ++i) {
-        uint64_t index = PACKED ? uint64_t(i) * kW8A8PanelWidth : uint64_t(i);
         int a = int(x[i]);
         [ForceUnroll] for (uint j = 0; j < uint(COLS); ++j)
-            sums[j] += uint(a * int(columns[j][index]));
+            sums[j] += uint(a * int(columns[j][i]));
     }
     [ForceUnroll] for (uint j = 0; j < uint(COLS); ++j)
         y[col + j] = EpQuantScale::apply(float(int32_t(sums[j])), row, col + j, ep);
+}
+
+// Signed W32 panels store the weights of 32 adjacent channels at each K.
+// Worker boundaries may cut either end of a panel. Only owned channels are stored.
+void packed_w8a8_gemv(
+    Ptr<int8_t, Access.Read> x, uint xs, Ptr<int8_t, Access.Read> w,
+    Ptr<float> y, uint ys, uint r0, uint r1, uint c0, uint c1, uint k, EpilogueParams ep)
+{
+    float neutral[kW8A8PanelWidth] = {};
+    for (uint r = r0; r < r1; ++r) {
+        Ptr<int8_t, Access.Read> xr = x + uint64_t(r) * xs;
+        Ptr<float> yr = y + uint64_t(r) * ys;
+        for (uint64_t start = uint64_t(c0 / kW8A8PanelWidth) * kW8A8PanelWidth; start < c1; start += kW8A8PanelWidth) {
+            Ptr<int8_t, Access.Read> wp = w + start * k;
+            uint sums[kW8A8PanelWidth];
+            for (uint c = 0; c < kW8A8PanelWidth; ++c) sums[c] = 0;
+            for (uint p = 0; p < k; ++p) {
+                int a = int(xr[p]);
+                for (uint c = 0; c < kW8A8PanelWidth; ++c)
+                    sums[c] += uint(a * int(wp[c]));
+                wp = wp + kW8A8PanelWidth;
+            }
+            uint lo = max(c0, uint(start)) - uint(start);
+            uint hi = min(kW8A8PanelWidth, c1 - uint(start));
+            EpilogueParams local = ep;
+            local.bias = ep.bias != nullptr ? ep.bias + start : Ptr<float, Access.Read>(&neutral[0]);
+            local.w_scale = ep.w_scale != nullptr ? ep.w_scale + start : Ptr<float, Access.Read>(&neutral[0]);
+            for (uint c = lo; c < hi; ++c) {
+                uint col = uint(start) + c;
+                yr[col] = EpQuantScale::apply(float(int32_t(sums[c])), r, c, local);
+            }
+        }
+    }
 }
 
 // Gather adjacent 32-channel storage panels into one NR-column compute tile.
@@ -429,8 +451,9 @@ void unpack_w8a8_panel<let NR : int>(
     for (uint j = 0; j < width;) {
         uint c = col + j;
         uint span = min(width - j, kW8A8PanelWidth - c % kW8A8PanelWidth);
-        Ptr<int8_t, Access.Read> src = w8a8_column<true>(weights, stride, c)
-                                    + uint64_t(k0) * kW8A8PanelWidth;
+        uint lane = c % kW8A8PanelWidth;
+        Ptr<int8_t, Access.Read> src = weights + uint64_t(c - lane) * stride + lane
+                                       + uint64_t(k0) * kW8A8PanelWidth;
         Ptr<float> outp = dst + j;
         for (uint p = 0; p < depth; ++p) {
             uint i = 0;
@@ -460,14 +483,18 @@ public void linear_w8a8_f32_slice_cpu<let MR : int, let NR : int, let PACKED : b
     static_assert(kKC > 0 && kKC <= 1024, "Each INT8 K block must sum exactly in F32");
     if (r0 >= r1 || c0 >= c1) return;
     if (r1 - r0 < kGemvRowThreshold) {
+        if (PACKED) {
+            packed_w8a8_gemv(x, x_stride, w, y, y_stride, r0, r1, c0, c1, k, ep);
+            return;
+        }
         for (uint r = r0; r < r1; ++r) {
             Ptr<int8_t, Access.Read> xr = x + uint64_t(r) * x_stride;
             Ptr<float> yr = y + uint64_t(r) * y_stride;
             uint c = c0;
             for (; c1 - c >= 4; c += 4)
-                w8a8_gemv_columns<PACKED, 4>(xr, w, w_stride, yr, r, c, k, ep);
+                w8a8_gemv_columns<4>(xr, w, w_stride, yr, r, c, k, ep);
             for (; c < c1; ++c)
-                w8a8_gemv_columns<PACKED, 1>(xr, w, w_stride, yr, r, c, k, ep);
+                w8a8_gemv_columns<1>(xr, w, w_stride, yr, r, c, k, ep);
         }
         return;
     }

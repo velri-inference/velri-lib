@@ -248,6 +248,71 @@ endif()
 
 velri_add_slang_cpu_variant(base ${_velri_base_mr} 16 8 "" "${VELRI_BASE_FLAGS}" ${_velri_base_defs})
 
+# G++ can vectorize a portable Slang byte reduction after C++ emission. Probe the
+# installed Slang prelude, generated instruction and C linker before enabling it.
+function(velri_add_slang_cpu_dot)
+    find_program(VELRI_SLANG_GXX NAMES g++ g++-16 g++-15 g++-14)
+    if(NOT VELRI_SLANG_GXX)
+        return()
+    endif()
+    set(_flags -std=c++17 -O3 -fPIC -fno-exceptions -fno-rtti -fno-strict-aliasing
+        ${_avx512_cc_flags} -mavx512vnni -mprefer-vector-width=512)
+    set(_probe "${VELRI_SLANG_GEN_DIR}/probe/dot")
+    file(MAKE_DIRECTORY "${_probe}")
+    file(WRITE "${_probe}/dot.slang" [=[
+[DllExport] export __extern_cpp uint velri_probe_dot(Ptr<uint8_t, Access.Read> x,
+    Ptr<int8_t, Access.Read> w, uint k) {
+    uint sum = 0;
+    for (uint i = 0; i < k; ++i) sum += uint(int(x[i]) * int(w[i]));
+    return sum;
+}
+]=])
+    execute_process(COMMAND "${VELRI_SLANGC}" "${_probe}/dot.slang" -target cpp -O3
+        -o "${_probe}/dot.cpp" RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
+    if(_rc EQUAL 0)
+        execute_process(COMMAND "${VELRI_SLANG_GXX}" ${_flags} -save-temps=obj
+            -c "${_probe}/dot.cpp" -o "${_probe}/dot.o"
+            RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
+    endif()
+    if(NOT _rc EQUAL 0 OR NOT EXISTS "${_probe}/dot.s")
+        return()
+    endif()
+    file(STRINGS "${_probe}/dot.s" _dot REGEX "vpdpbusd[ \t].*zmm" LIMIT_COUNT 1)
+    if(NOT _dot)
+        return()
+    endif()
+    file(WRITE "${_probe}/main.c" [=[
+#include <stdint.h>
+extern uint32_t velri_probe_dot(const uint8_t *, const int8_t *, uint32_t);
+int main(void) { return (int)velri_probe_dot(0, 0, 0); }
+]=])
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
+    try_compile(_links "${_probe}/link" "${_probe}/main.c" LINK_LIBRARIES "${_probe}/dot.o")
+    if(NOT _links)
+        return()
+    endif()
+
+    set(_source "${VELRI_SLANG_DIR}/ops/w8a8_dot.slang")
+    set(_cpp "${VELRI_SLANG_GEN_DIR}/slang_cpu_dot.cpp")
+    set(_obj "${VELRI_SLANG_GEN_DIR}/slang_cpu_dot.o")
+    add_custom_command(OUTPUT "${_cpp}"
+        COMMAND "${VELRI_SLANGC}" "${_source}" -target cpp -O3
+            -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops" -o "${_cpp}"
+        DEPENDS "${_source}" ${VELRI_SLANG_CPU_DEPS} "${VELRI_SLANGC}"
+        COMMENT "Slang AOT CPU (W8A8 byte dot -> C++)"
+        VERBATIM)
+    add_custom_command(OUTPUT "${_obj}"
+        COMMAND "${VELRI_SLANG_GXX}" ${_flags} -MD -MF "${_obj}.d" -c "${_cpp}" -o "${_obj}"
+        DEPENDS "${_cpp}" "${VELRI_SLANG_GXX}"
+        DEPFILE "${_obj}.d"
+        COMMENT "Slang AOT CPU (W8A8 byte dot, G++)"
+        VERBATIM)
+    set_source_files_properties("${_obj}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+    set(VELRI_SLANG_CPU_OBJS ${VELRI_SLANG_CPU_OBJS} "${_obj}" PARENT_SCOPE)
+    set(VELRI_HAS_SLANG_CPU_DOT 1 PARENT_SCOPE)
+endfunction()
+
+set(VELRI_HAS_SLANG_CPU_DOT 0)
 if(VELRI_X86_VARIANTS)
     if(VELRI_MSVC_FRONTEND)
         set(_avx2_cc_flags /arch:AVX2)
@@ -262,6 +327,16 @@ if(VELRI_X86_VARIANTS)
     set(_avx512_features "+avx2,+avx512f,+avx512bw,+avx512dq,+avx512vl,+fma,+f16c")
     velri_add_slang_cpu_variant(avx512 6 64 32 "${_avx512_features}"
         "${_avx512_cc_flags}")
+    if(VELRI_SLANG_CPU_DOT AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING
+       AND NOT CMAKE_SYSROOT AND NOT CMAKE_C_COMPILER_TARGET AND NOT VELRI_SLANG_TARGET_TRIPLE
+       AND NOT _velri_raw_c_flags MATCHES "(^| )(-target |--target=|--sysroot=)")
+        velri_add_slang_cpu_dot()
+        if(VELRI_HAS_SLANG_CPU_DOT)
+            message(STATUS "Velri-lib Slang W8A8 byte-dot AOT: ${VELRI_SLANG_GXX}")
+        else()
+            message(STATUS "Velri-lib Slang W8A8: using standard AOT (G++ byte-dot probe unavailable)")
+        endif()
+    endif()
 endif()
 
 # ============================================================================
