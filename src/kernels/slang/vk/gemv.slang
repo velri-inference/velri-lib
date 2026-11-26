@@ -97,8 +97,9 @@ void vk_gemv_w8a8(uniform LinearArgs<int8_t, int8_t, float> a, uint3 gtid : SV_G
     }
     int32_t total = WaveActiveSum(acc);
     if (lane == 0u) {
-        a.y[uint64_t(row) * uint64_t(a.y_stride) + uint64_t(col)] =
-            EpQuantScale::apply(float(total), row, col, make_epilogue_params(a.bias, a.x_scale, a.w_scale, a.flags));
+        precise float y = EpQuantScale::apply(float(total), row, col, make_epilogue_params(a.bias, a.x_scale, a.w_scale, a.flags));
+        a.y[uint64_t(row) * uint64_t(a.y_stride) + col] = y;
+        if (a.residual != nullptr) a.residual[col] += y;
     }
 }
 

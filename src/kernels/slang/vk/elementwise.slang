@@ -313,14 +313,16 @@ void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThre
     Ptr<int8_t> qr = a.x_i8 + uint64_t(row) * uint64_t(a.xi8_stride);
 
     bool aligned = ((a.k & 3u) == 0u) && is_ptr_aligned16(xr) && is_ptr_aligned4(qr);
-    if (aligned && a.k <= kRowRegCacheMaxDim) {
+    // Cache one row through the max reduction so the output needs no second input pass.
+    static const uint chunks = 8u;
+    if (aligned && a.k <= chunks * 4u * kRowWgSize) {
         uint n4 = a.k >> 2u;
         Ptr<float4, Access.Read> xr4 = Ptr<float4, Access.Read>(xr);
         Ptr<uint> qr4 = Ptr<uint>(qr);
 
-        float4 reg[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+        float4 reg[chunks];
         float local_max = 0.0f;
-        [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+        [ForceUnroll] for (uint s = 0u; s < chunks; ++s) {
             uint idx = s * kRowWgSize + tid;
             if (idx < n4) {
                 float4 v = load_a16(xr4 + idx);
@@ -334,12 +336,12 @@ void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThre
         compute_sym_i8_scale(amax, scale, inv_scale);
         if (tid == 0u) a.scale_out[row] = scale;
         if (inv_scale == 0.0f) {
-            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+            [ForceUnroll] for (uint s = 0u; s < chunks; ++s) {
                 uint idx = s * kRowWgSize + tid;
                 if (idx < n4) qr4[idx] = 0u;
             }
         } else {
-            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+            [ForceUnroll] for (uint s = 0u; s < chunks; ++s) {
                 uint idx = s * kRowWgSize + tid;
                 if (idx < n4) qr4[idx] = pack_i8x4_scaled(reg[s] * inv_scale);
             }
@@ -359,5 +361,111 @@ void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThre
         for (uint c = tid; c < a.k; c += kRowWgSize) qr[c] = int8_t(0);
     } else {
         for (uint c = tid; c < a.k; c += kRowWgSize) qr[c] = quantize_sym_i8(xr[c], inv_scale);
+    }
+}
+
+struct QuantGemvArgs {
+    Ptr<float4, Access.Read> x;
+    Ptr<uint> x_i8;
+    Ptr<float> scale_out;
+    Ptr<uint4, Access.Read> weights;
+    Ptr<float, Access.Read> weight_scale;
+    Ptr<float> y;
+    Ptr<float> residual;
+    uint channels;
+    uint k4;
+    uint stride16;
+};
+
+groupshared uint quant_words[2u * kRowWgSize];
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_quant_gemv_w8a8(uniform QuantGemvArgs a, uint3 group : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint tid = gtid.x;
+    float4 reg[2] = { float4(0.0f), float4(0.0f) };
+    float peak = 0.0f;
+    [ForceUnroll] for (uint j = 0u; j < 2u; ++j) {
+        uint i = tid + j * kRowWgSize;
+        if (i < a.k4) {
+            reg[j] = load_a16(a.x + i);
+            float4 v = abs(reg[j]);
+            peak = max(peak, max(max(v.x, v.y), max(v.z, v.w)));
+        }
+    }
+    float scale, inv_scale;
+    compute_sym_i8_scale(wg_reduce_max(peak, tid, kRowWgSize), scale, inv_scale);
+    if (group.x == 0u && tid == 0u) a.scale_out[0] = scale;
+    [ForceUnroll] for (uint j = 0u; j < 2u; ++j) {
+        uint i = tid + j * kRowWgSize;
+        if (i < a.k4) {
+            uint packed = inv_scale == 0.0f ? 0u : pack_i8x4_scaled(reg[j] * inv_scale);
+            quant_words[i] = packed;
+            if (group.x == 0u) a.x_i8[i] = packed;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint lanes = WaveGetLaneCount();
+    uint col = group.x * (kRowWgSize / lanes) + WaveGetWaveIndex();
+    if (col >= a.channels) return;
+    Ptr<uint4, Access.Read> weights = a.weights + uint64_t(col) * a.stride16;
+    int32_t sum = 0;
+    for (uint i = WaveGetLaneIndex(); i < a.k4 / 4u; i += lanes) {
+        uint4 w = load_a16(weights + i);
+        sum = dot4add_i8packed(quant_words[4u*i], w.x, sum);
+        sum = dot4add_i8packed(quant_words[4u*i + 1u], w.y, sum);
+        sum = dot4add_i8packed(quant_words[4u*i + 2u], w.z, sum);
+        sum = dot4add_i8packed(quant_words[4u*i + 3u], w.w, sum);
+    }
+    sum = WaveActiveSum(sum);
+    if (WaveGetLaneIndex() == 0u) {
+        precise float y = float(sum) * (a.weight_scale[col] * scale);
+        a.y[col] = y;
+        if (a.residual != nullptr) a.residual[col] = a.residual[col] + y;
+    }
+}
+
+struct RmsQuantArgs {
+    Ptr<float4, Access.Read> x;
+    Ptr<float4, Access.Read> weight;
+    Ptr<float4> normalized;
+    Ptr<uint> quantized;
+    Ptr<float> scale;
+    uint dim;
+    float eps;
+};
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_rms_quant(uniform RmsQuantArgs a, uint3 gtid : SV_GroupThreadID) {
+    uint tid = gtid.x, count = a.dim / 4u;
+    float4 values[2], weights[2];
+    float energy = 0.0f;
+    [ForceUnroll] for (uint j = 0u; j < 2u; ++j) {
+        uint i = tid + j * kRowWgSize;
+        if (i < count) {
+            values[j] = load_a16(a.x + i);
+            // Standalone RMS adds +0 to gamma when unit_offset is disabled, mapping -0 to +0.
+            float4 w = load_a16(a.weight + i);
+            weights[j] = select(w == float4(0.0f), float4(0.0f), w);
+            energy += dot(values[j], values[j]);
+        }
+    }
+    float inv_rms = rsqrt(wg_reduce_sum(energy, tid, kRowWgSize) / float(a.dim) + a.eps);
+    float peak = 0.0f;
+    [ForceUnroll] for (uint j = 0u; j < 2u; ++j) {
+        uint i = tid + j * kRowWgSize;
+        if (i < count) {
+            values[j] *= inv_rms * weights[j];
+            store_a16(a.normalized + i, values[j]);
+            float4 v = abs(values[j]);
+            peak = max(peak, max(max(v.x, v.y), max(v.z, v.w)));
+        }
+    }
+    float scale, inv_scale;
+    compute_sym_i8_scale(wg_reduce_max(peak, tid, kRowWgSize), scale, inv_scale);
+    if (tid == 0u) a.scale[0] = scale;
+    [ForceUnroll] for (uint j = 0u; j < 2u; ++j) {
+        uint i = tid + j * kRowWgSize;
+        if (i < count) a.quantized[i] = inv_scale == 0.0f ? 0u : pack_i8x4_scaled(values[j] * inv_scale);
     }
 }

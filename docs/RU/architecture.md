@@ -123,4 +123,4 @@ flowchart TD
 | `src/backend/vulkan/` | Есть (опционально `-DVELRI_ENABLE_VULKAN=ON`) | Встроенный Vulkan 1.3 / SPIR-V 1.6 бэкенд (`vk_internal.h`, `vk_{device,memory,pipeline,dispatch}.c`) с кольцом `VkFence` |
 | `tests/`, `tools/`, `cmake/` | Есть | Эталоны (`reference.c`), `test_kernels`, `test_core_contract` (+ `mock_async`), опциональные `bench_slang_cpu`/`bench_vulkan`, `slang.cmake` |
 
-Пустые каталоги заранее не заводятся; модули появляются вместе с проверяемой реализацией. Инструкции сборки библиотеки и её интеграции в Velri — в [velri-lib/README.md](../../README.md) и [архитектуре Velri](../../../docs/RU/architecture.md).
+Пустые каталоги заранее не заводятся; модули появляются вместе с проверяемой реализацией. Инструкции сборки библиотеки и её интеграции в Velri — в [velri-lib/README.md](../../README.md) и [архитектуре Velri](https://github.com/velri-inference/velri/blob/main/docs/RU/architecture.md).

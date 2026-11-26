@@ -113,7 +113,9 @@ velri_tensor velri_block_lm_head(velri_builder *b, velri_tensor x, const velri_l
         goto cleanup;
     }
     logits.is_seq_dynamic = h.is_seq_dynamic;
-    out = velri_b_linear_into(b, h, lm_head_w, lm_head_b, logits);
+    velri_projection_input input = velri_blocks_projection_input(b, h, spec->dtype);
+    velri_tensor scale = velri_blocks_weight_scale(b, nullptr, spec->weight_name, "_scale", lm_head_w);
+    out = velri_blocks_linear_into(b, input, lm_head_w, lm_head_b, scale, logits);
 
 cleanup:
     if (pushed_scope) {

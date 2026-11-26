@@ -47,7 +47,7 @@ typedef struct {
 
 typedef struct {
     char name[VELRI_MANIFEST_NAME_MAX];        /* Logical tensor name (e.g. "transformer.wte.weight") */
-    char source_name[VELRI_MANIFEST_NAME_MAX]; /* Optional alias source (e.g. tied wte on another dev) */
+    char source_name[VELRI_MANIFEST_NAME_MAX]; /* Canonical weight name for a replica on another device */
     velri_storage_id storage_id;
     velri_view_id view_id;
     velri_dtype dtype;
@@ -55,6 +55,10 @@ typedef struct {
     size_t dims[VELRI_MAX_RANK];
     velri_device_id device_id;
 } velri_manifest_entry;
+
+static inline const char *velri_manifest_weight_source(const velri_manifest_entry *entry) {
+    return entry->source_name[0] ? entry->source_name : entry->name;
+}
 
 typedef struct {
     velri_storage_id token_ids_in;
@@ -67,10 +71,13 @@ typedef struct {
     velri_manifest_entry *states;
     uint32_t num_states;
     uint32_t cap_states;
+
+    struct velri_weight_alias *weight_aliases; /* Additional names of existing bindings. */
 } velri_manifest;
 
 void velri_manifest_init(velri_manifest *m);
 void velri_manifest_destroy(velri_manifest *m);
+/* weights[] lists one binding per source and device. Remote tied names also resolve here. */
 const velri_manifest_entry *velri_manifest_find_weight(const velri_manifest *m, const char *name);
 const velri_manifest_entry *velri_manifest_find_state(const velri_manifest *m, const char *name);
 

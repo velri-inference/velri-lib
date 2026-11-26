@@ -49,6 +49,29 @@ static inline bool velri_blocks_format_layer_prefix(velri_builder *b,
     return true;
 }
 
+/* Prepared once for projections that share the same unmodified activation. In
+ * W8A8, values are signed bytes and scale contains one float per sequence row. */
+typedef struct {
+    velri_tensor values;
+    velri_tensor scale;
+} velri_projection_input;
+
+velri_projection_input velri_blocks_projection_input(velri_builder *b, velri_tensor x,
+                                                     velri_dtype w_dtype);
+velri_tensor velri_blocks_project(velri_builder *b, velri_projection_input input, const char *prefix,
+                                  const char *name, velri_dtype w_dtype, size_t out_dim, bool bias);
+velri_tensor velri_blocks_linear_into(velri_builder *b, velri_projection_input input, velri_tensor w,
+                                      velri_tensor bias, velri_tensor weight_scale, velri_tensor out);
+
+static inline velri_tensor velri_blocks_weight_scale(velri_builder *b, const char *prefix,
+                                                      const char *name, const char *suffix,
+                                                      velri_tensor weight) {
+    if (weight.dtype != VELRI_DTYPE_I8) return VELRI_TENSOR_NONE;
+    char scale_name[VELRI_MANIFEST_NAME_MAX];
+    if (!velri_blocks_format_name(b, scale_name, prefix, name, suffix)) return VELRI_TENSOR_NONE;
+    return velri_b_weight(b, scale_name, VELRI_DTYPE_F32, 1U, weight.dims);
+}
+
 /* Central activation/output dtype promotion contract for Linear projections. */
 static inline velri_dtype velri_blocks_linear_out_dtype(velri_dtype x_dtype, velri_dtype w_dtype) {
     return (x_dtype == VELRI_DTYPE_F64 && w_dtype == VELRI_DTYPE_F64) ? VELRI_DTYPE_F64

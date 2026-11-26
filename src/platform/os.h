@@ -67,6 +67,24 @@ void velri_os_cond_broadcast(velri_os_cond *cv);
 int velri_os_hardware_threads(void);
 /* Count accessible physical cores. Zero means the platform could not identify them. */
 uint32_t velri_os_available_physical_cores(void);
+
+/* Process-coordinated 1-to-1 physical-core pinning plan for a worker pool.
+ * Returns nullptr when pinning is unsupported, topology is heterogeneous/untrusted,
+ * or concurrent pools oversubscribe available physical cores. */
+typedef struct velri_os_pin_plan velri_os_pin_plan;
+velri_os_pin_plan *velri_os_pin_acquire(size_t num_workers);
+void velri_os_pin_release(velri_os_pin_plan *plan);
+/* Pin worker thread `worker_id` (1..num_workers-1) to its reserved physical core. */
+void velri_os_pin_worker(const velri_os_pin_plan *plan, size_t worker_id);
+/* Temporarily exclude all pinned worker cores (and their SMT siblings) from the
+ * caller thread's affinity mask during a parallel section, restoring the caller's
+ * exact prior mask on leave (zero heap allocations on the hot path). */
+typedef struct {
+    velri_os_pin_plan *plan;
+    bool active;
+} velri_os_affinity_guard;
+void velri_os_caller_guard_enter(velri_os_pin_plan *plan, velri_os_affinity_guard *guard);
+void velri_os_caller_guard_leave(const velri_os_affinity_guard *guard);
 void velri_os_cpu_relax(void);
 size_t velri_os_ctz64(uint64_t x);
 

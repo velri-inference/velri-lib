@@ -28,14 +28,17 @@ typedef struct {
 
 struct velri_pool {
     size_t num_workers;
+    velri_os_pin_plan *pin_plan;
     atomic_bool stopping;
-    velri_parallel_fn fn;
-    void *fn_ctx;
     size_t last_nw;
     uint64_t host_gen;
-    alignas(64) _Atomic uint64_t dispatch_word; /* (gen << 16) | (nw & 0xFFFFU) */
-    alignas(64) _Atomic uint64_t parked_mask[VELRI_POOL_MASK_WORDS];
     velri_worker_slot *slots;
+    /* Co-locate dispatch_word + fn + fn_ctx on one 64B cache line so waking workers
+     * fetch all three in a single cross-CCD cache transfer instead of two. */
+    alignas(64) _Atomic uint64_t dispatch_word; /* (gen << 16) | (nw & 0xFFFFU) */
+    velri_parallel_fn fn;
+    void *fn_ctx;
+    alignas(64) _Atomic uint64_t parked_mask[VELRI_POOL_MASK_WORDS];
 };
 
 static inline uint64_t pack_dispatch_word(uint64_t gen, size_t nw) {
@@ -78,6 +81,7 @@ static void worker_loop(void *arg) {
     const size_t mask_idx = wid >> 6;
     const uint64_t mask_bit = UINT64_C(1) << (wid & 63U);
 
+    velri_os_pin_worker(pool->pin_plan, wid);
     atomic_store_explicit(&slot->done_gen, UINT64_C(1), memory_order_release);
 
     uint64_t g = UINT64_C(1);
@@ -88,21 +92,33 @@ static void worker_loop(void *arg) {
         unpack_dispatch_word(word, &cg, &cnw);
 
         if (cg == g && wid < cnw) {
-            const uint64_t deadline = velri_os_monotonic_ns() + UINT64_C(250000000);
-            do {
-                for (int spin = 0; spin < 2048; ++spin) {
-                    velri_os_cpu_relax();
-                    word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
-                    unpack_dispatch_word(word, &cg, &cnw);
-                    if (cg != g) {
-                        break;
-                    }
-                }
-                if (cg != g || wid >= cnw ||
-                    atomic_load_explicit(&pool->stopping, memory_order_relaxed)) {
+            /* Fast spin before calling monotonic_ns() to avoid vDSO overhead on back-to-back ops. */
+            for (int spin = 0; spin < 1024; ++spin) {
+                velri_os_cpu_relax();
+                word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
+                unpack_dispatch_word(word, &cg, &cnw);
+                if (cg != g) {
                     break;
                 }
-            } while (velri_os_monotonic_ns() < deadline);
+            }
+            if (cg == g && wid < cnw &&
+                !atomic_load_explicit(&pool->stopping, memory_order_relaxed)) {
+                const uint64_t deadline = velri_os_monotonic_ns() + UINT64_C(250000000);
+                do {
+                    for (int spin = 0; spin < 2048; ++spin) {
+                        velri_os_cpu_relax();
+                        word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
+                        unpack_dispatch_word(word, &cg, &cnw);
+                        if (cg != g) {
+                            break;
+                        }
+                    }
+                    if (cg != g || wid >= cnw ||
+                        atomic_load_explicit(&pool->stopping, memory_order_relaxed)) {
+                        break;
+                    }
+                } while (velri_os_monotonic_ns() < deadline);
+            }
         }
 
         if (cg == g || wid >= cnw) {
@@ -139,6 +155,7 @@ static void free_pool_slots(velri_pool *pool, size_t count) {
         velri_os_cond_destroy(pool->slots[j].cv);
         velri_os_mutex_destroy(pool->slots[j].mtx);
     }
+    velri_os_pin_release(pool->pin_plan);
     velri_os_aligned_free(pool->slots);
     velri_os_aligned_free(pool);
 }
@@ -171,6 +188,7 @@ velri_status velri_pool_create(size_t num_workers, velri_pool **out_pool) {
     }
     memset(pool->slots, 0, num_workers * sizeof(velri_worker_slot));
 
+    pool->pin_plan = (num_workers > 1U) ? velri_os_pin_acquire(num_workers) : nullptr;
     for (size_t i = 0U; i < num_workers; ++i) {
         pool->slots[i].worker_id = i;
         pool->slots[i].pool = pool;
@@ -228,6 +246,9 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
         return;
     }
 
+    velri_os_affinity_guard pin_guard;
+    velri_os_caller_guard_enter(pool->pin_plan, &pin_guard);
+
     size_t nw = active_workers < pool->num_workers ? active_workers : pool->num_workers;
     pool->last_nw = nw;
     pool->fn = fn;
@@ -264,4 +285,6 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
             velri_os_cpu_relax();
         }
     }
+
+    velri_os_caller_guard_leave(&pin_guard);
 }

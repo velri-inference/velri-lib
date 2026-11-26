@@ -27,6 +27,7 @@ set(VELRI_SLANG_COMMON_DEPS
     "${VELRI_SLANG_DIR}/common/key_iter.slang"
 )
 set(VELRI_SLANG_CPU_DEPS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cpu/w8a8_layout.h"
     ${VELRI_SLANG_COMMON_DEPS}
     "${VELRI_SLANG_DIR}/ops/norm.slang"
     "${VELRI_SLANG_DIR}/ops/rope.slang"
@@ -188,6 +189,7 @@ function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_is
 
     set(_slang_cmd "${VELRI_SLANGC}" "${VELRI_SLANG_CPU_ENTRY}"
         -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
+        -I "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cpu"
         -fp-mode fast -DVELRI_ISA=${isa} -DVELRI_MR=${mr}
         -DVELRI_NR_F32=${nr_f32} -DVELRI_NR_F64=${nr_f64} ${ARGN})
 
@@ -284,7 +286,7 @@ function(velri_add_slang_cpu_dot)
 extern uint32_t velri_probe_dot(const uint8_t *, const int8_t *, uint32_t);
 int main(void) { return (int)velri_probe_dot(0, 0, 0); }
 ]=])
-    set(_flags -O3 -fPIC ${_avx512_cc_flags} -mavx512vnni -mprefer-vector-width=512)
+    set(_flags -O3 -fPIC ${_avx512_cc_flags} -mavx512vnni)
     set(_source "${VELRI_SLANG_DIR}/ops/w8a8_dot.slang")
     set(_base "${VELRI_SLANG_GEN_DIR}/slang_cpu_dot")
     set(_deps "${_source}" "${VELRI_SLANG_DIR}/common/epilogue.slang" "${VELRI_SLANGC}")
@@ -359,10 +361,10 @@ set(VELRI_HAS_SLANG_CPU_DOT 0)
 if(VELRI_X86_VARIANTS)
     if(VELRI_MSVC_FRONTEND)
         set(_avx2_cc_flags /arch:AVX2)
-        set(_avx512_cc_flags /arch:AVX512)
+        set(_avx512_cc_flags /arch:AVX512 /clang:-mprefer-vector-width=512)
     else()
         set(_avx2_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mfma -mf16c)
-        set(_avx512_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -mf16c)
+        set(_avx512_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -mf16c -mprefer-vector-width=512)
     endif()
     velri_add_slang_cpu_variant(avx2 3 32 16
         "+avx2,+fma,+f16c"
@@ -491,6 +493,7 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/elementwise.slang|vk_softmax_f32"
         "${_vk}/elementwise.slang|vk_fwht_f32"
         "${_vk}/elementwise.slang|vk_quantize_row_f32_i8"
+        "${_vk}/elementwise.slang|vk_rms_quant"
         "${_vk}/gemv.slang|vk_gemv_f32"
         "${_vk}/decode_fusion.slang|vk_qkv_rope_cache_f32"
         "${_vk}/decode_fusion.slang|vk_qkv_rope_cache_f16kv"
@@ -502,6 +505,9 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/gemv.slang|vk_gemv_f16"
         "${_vk}/gemv.slang|vk_gemv_bf16"
         "${_vk}/gemv.slang|vk_gemv_w8a8"
+        "${_vk}/elementwise.slang|vk_quant_gemv_w8a8"
+        "${_vk}/w8_projections.slang|vk_gated_w8a8"
+        "${_vk}/w8_projections.slang|vk_qkv_rope_w8a8"
         "${_vk}/gemm_f32.slang|vk_gemm_f32"
         "${_vk}/gemm_short.slang|vk_gemm_short_f32"
         "${_vk}/gemv.slang|vk_gemv_rows_f32"
@@ -513,6 +519,7 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/gemm_coopmat.slang|vk_gemm_f32_as_f16"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_bf16_64"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_w8a8_64"
+        "${_vk}/gemm_coopmat.slang|vk_gemm_short_w8a8"
         "${_vk}/gather_copy.slang|vk_embedding_f32"
         "${_vk}/gather_copy.slang|vk_copy_last_row_f32"
         "${_vk}/attention.slang|vk_kv_append_f32"

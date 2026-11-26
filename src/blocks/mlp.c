@@ -32,14 +32,15 @@ velri_tensor velri_block_mlp(velri_builder *b, velri_tensor x, const char *prefi
     size_t d_inter = (size_t)spec->intermediate_size;
 
     velri_tensor h = VELRI_TENSOR_NONE;
+    velri_projection_input input = velri_blocks_projection_input(b, x, spec->dtype);
     if (!spec->is_gated) {
-        h = velri_block_linear(b, x, prefix, spec->up_name, spec->dtype, d_inter, spec->has_bias);
+        h = velri_blocks_project(b, input, prefix, spec->up_name, spec->dtype, d_inter, spec->has_bias);
         h = velri_b_activation_inplace(b, h, spec->act);
     } else {
         velri_tensor g =
-            velri_block_linear(b, x, prefix, spec->gate_name, spec->dtype, d_inter, spec->has_bias);
+            velri_blocks_project(b, input, prefix, spec->gate_name, spec->dtype, d_inter, spec->has_bias);
         velri_tensor u =
-            velri_block_linear(b, x, prefix, spec->up_name, spec->dtype, d_inter, spec->has_bias);
+            velri_blocks_project(b, input, prefix, spec->up_name, spec->dtype, d_inter, spec->has_bias);
         h = velri_b_gated_mlp_act_inplace(b, g, u, spec->act, spec->clamp_limit);
     }
 

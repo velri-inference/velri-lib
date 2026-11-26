@@ -49,7 +49,7 @@ Device A resource  ──►  agreed RAM staging buffer  ──►  Device B res
 4. The staging slot returns to the pool only after its last consumer completes.
 
 ### Disk as a data source
-Large disk-backed tables (e.g., n-gram PLE tables; see [qwen4_exp.md](../../../docs/EN/models/qwen4_exp.md)) use bounded staging buffers with an explicit dependency between row loading/decoding and the first compute consumer. File I/O lives in the platform layer; disk benchmarks explicitly account for OS page cache effects.
+Large disk-backed tables (e.g., n-gram PLE tables; see [qwen4_exp.md](https://github.com/velri-inference/velri/blob/main/docs/EN/models/qwen4_exp.md)) use bounded staging buffers with an explicit dependency between row loading/decoding and the first compute consumer. File I/O lives in the platform layer; disk benchmarks explicitly account for OS page cache effects.
 
 ---
 

@@ -57,8 +57,6 @@ bool velri_tensor_view_identical_layout(const velri_tensor_view *a, const velri_
 bool velri_tensor_view_no_partial_overlap(const velri_tensor_view *in,
                                           const velri_tensor_view *out);
 bool velri_tensor_view_covers_storage(const velri_tensor_view *v, size_t storage_bytes);
-velri_status velri_shape_byte_size(velri_dtype dtype, uint32_t rank, const size_t *dims,
-                                   size_t *out_bytes);
 
 /* ---- Context & Registered Backends ---- */
 

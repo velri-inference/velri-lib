@@ -123,4 +123,4 @@ Input storage, weight storage, accumulator, and output dtypes are specified inde
 | `src/backend/vulkan/` | Implemented (opt-in `-DVELRI_ENABLE_VULKAN=ON`) | Built-in Vulkan 1.3 / SPIR-V 1.6 backend (`vk_internal.h`, `vk_{device,memory,pipeline,dispatch}.c`) with async `VkFence` ring |
 | `tests/`, `tools/`, `cmake/` | Implemented | References (`reference.c`), `test_kernels`, `test_core_contract` (+ `mock_async`), optional `bench_slang_cpu`/`bench_vulkan`, `slang.cmake` |
 
-Planned directories are not populated with stub APIs ahead of working code. Standalone and integrated build instructions live in [velri-lib/README.md](../../README.md) and [Velri Architecture](../../../docs/EN/architecture.md).
+Planned directories are not populated with stub APIs ahead of working code. Standalone and integrated build instructions live in [velri-lib/README.md](../../README.md) and [Velri Architecture](https://github.com/velri-inference/velri/blob/main/docs/EN/architecture.md).

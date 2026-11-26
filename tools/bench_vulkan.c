@@ -1,5 +1,6 @@
 #define VK_NO_PROTOTYPES
 
+#include "bench_decode.h"
 #include "os.h"
 #include "reference.h"
 #include "velri_lib/velri_lib.h"
@@ -310,21 +311,28 @@ static vk_ceilings measure_vk_ceilings(void) {
     return out;
 }
 
+static int compare_times(const void *left, const void *right) {
+    double a = *(const double *)left, b = *(const double *)right;
+    return (a > b) - (a < b);
+}
+
 /* Benchmark a Vulkan Linear op via batched `velri_slot` (resident WEIGHT + STATE, 0 PCIe traffic). */
 static double bench_vk_linear_ms(velri_context *ctx, velri_device_id dev, velri_linear_desc d,
-                                 size_t rows, size_t m, size_t k, uint32_t batch_reps) {
+                                 size_t rows, size_t m, size_t k, uint32_t batch_reps, size_t weights) {
     size_t xb = velri_dtype_bytes(d.x_dtype);
     size_t wb = velri_dtype_bytes(d.w_dtype);
     size_t yb = velri_dtype_bytes(d.y_dtype);
 
     velri_graph *g = nullptr;
     check_ok(velri_graph_create(&g), "g");
-    velri_storage_id sx = 0U, sw = 0U, sy = 0U, sxs = 0U, sws = 0U;
+    velri_storage_id sx = 0U, sy = 0U, sxs = 0U, sws = 0U;
+    velri_storage_id sw[3];
+    velri_view_id vw[3];
+    if (!weights || weights > sizeof(sw) / sizeof(sw[0]) || batch_reps % weights) abort();
     velri_storage_desc dx = {VELRI_STORAGE_WEIGHT, d.x_dtype, rows * k * xb, 256U, dev};
     velri_storage_desc dw = {VELRI_STORAGE_WEIGHT, d.w_dtype, m * k * wb, 256U, dev};
     velri_storage_desc dy = {VELRI_STORAGE_STATE, d.y_dtype, rows * m * yb, 256U, dev};
     check_ok(velri_graph_add_storage(g, &dx, &sx), "sx");
-    check_ok(velri_graph_add_storage(g, &dw, &sw), "sw");
     check_ok(velri_graph_add_storage(g, &dy, &sy), "sy");
     if (d.has_x_scale) {
         velri_storage_desc dxs = {VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, rows * sizeof(float), 256U, dev};
@@ -337,12 +345,15 @@ static double bench_vk_linear_ms(velri_context *ctx, velri_device_id dev, velri_
 
     size_t xd[2] = {rows, k}, wd[2] = {m, k}, yd[2] = {rows, m}, xsd[1] = {rows}, wsd[1] = {m};
     velri_tensor_view vxt, vwt, vyt, vxst, vwst;
-    velri_view_id vx = 0U, vw = 0U, vy = 0U, vxs = VELRI_INVALID_ID, vws = VELRI_INVALID_ID;
+    velri_view_id vx = 0U, vy = 0U, vxs = VELRI_INVALID_ID, vws = VELRI_INVALID_ID;
     check_ok(velri_tensor_view_contiguous(sx, d.x_dtype, 2U, xd, 0U, &vxt), "vx");
-    check_ok(velri_tensor_view_contiguous(sw, d.w_dtype, 2U, wd, 0U, &vwt), "vw");
     check_ok(velri_tensor_view_contiguous(sy, d.y_dtype, 2U, yd, 0U, &vyt), "vy");
     check_ok(velri_graph_add_view(g, &vxt, &vx), "avx");
-    check_ok(velri_graph_add_view(g, &vwt, &vw), "avw");
+    for (size_t i = 0U; i < weights; ++i) {
+        check_ok(velri_graph_add_storage(g, &dw, &sw[i]), "sw");
+        check_ok(velri_tensor_view_contiguous(sw[i], d.w_dtype, 2U, wd, 0U, &vwt), "vw");
+        check_ok(velri_graph_add_view(g, &vwt, &vw[i]), "avw");
+    }
     check_ok(velri_graph_add_view(g, &vyt, &vy), "avy");
     if (d.has_x_scale) {
         check_ok(velri_tensor_view_contiguous(sxs, VELRI_DTYPE_F32, 1U, xsd, 0U, &vxst), "vxs");
@@ -355,10 +366,11 @@ static double bench_vk_linear_ms(velri_context *ctx, velri_device_id dev, velri_
 
     velri_op_desc op = {
         .kind = VELRI_OP_LINEAR, .num_inputs = 5U, .num_outputs = 1U,
-        .inputs = {vx, vw, VELRI_INVALID_ID, vxs, vws}, .outputs = {vy},
+        .inputs = {vx, VELRI_INVALID_ID, VELRI_INVALID_ID, vxs, vws}, .outputs = {vy},
         .attr.linear.desc = d,
     };
     for (uint32_t i = 0U; i < batch_reps; ++i) {
+        op.inputs[1] = vw[i % weights];
         check_ok(velri_graph_add_op(g, &op, dev, nullptr), "add op");
     }
 
@@ -373,7 +385,6 @@ static double bench_vk_linear_ms(velri_context *ctx, velri_device_id dev, velri_
     uint64_t rng = 0xD0000001ULL;
     void *hx = xalloc(rows * k * xb);
     void *hw = xalloc(m * k * wb);
-    void *hy = xalloc(rows * m * yb);
     float *hxs = d.has_x_scale ? (float *)xalloc(rows * sizeof(float)) : nullptr;
     float *hws = d.has_w_scale ? (float *)xalloc(m * sizeof(float)) : nullptr;
     velri_test_fill_dtype(d.x_dtype, hx, rows * k, &rng, 0.5f);
@@ -382,37 +393,78 @@ static double bench_vk_linear_ms(velri_context *ctx, velri_device_id dev, velri_
     if (hws) velri_test_fill_dtype(VELRI_DTYPE_F32, hws, m, &rng, 0.02f);
 
     check_ok(velri_plan_bind_weight_host(plan, sx, hx, rows * k * xb), "bx");
-    check_ok(velri_plan_bind_weight_host(plan, sw, hw, m * k * wb), "bw");
+    for (size_t i = 0U; i < weights; ++i)
+        check_ok(velri_plan_bind_weight_host(plan, sw[i], hw, m * k * wb), "bw");
     if (hxs) check_ok(velri_plan_bind_weight_host(plan, sxs, hxs, rows * sizeof(float)), "bxs");
     if (hws) check_ok(velri_plan_bind_weight_host(plan, sws, hws, m * sizeof(float)), "bws");
 
     velri_slot *slot = nullptr;
     check_ok(velri_slot_create(plan, &slot), "slot");
-    check_ok(velri_slot_bind_host(slot, sy, hy, rows * m * yb), "by");
-    check_ok(velri_slot_run(slot, nullptr, nullptr), "warmup");
-
-    uint64_t t0 = velri_os_monotonic_ns();
-    for (int s = 0; s < 3; ++s) {
-        check_ok(velri_slot_run(slot, nullptr, nullptr), "run");
+    // Sustain GPU clocks and amortize queue submission over multiple graph replays.
+    uint64_t warm = velri_os_monotonic_ns();
+    do {
+        check_ok(velri_slot_run(slot, nullptr, nullptr), "warmup");
+    } while (velri_os_monotonic_ns() - warm < 180000000U);
+    double times[5];
+    for (size_t s = 0U; s < 5U; ++s) {
+        uint64_t start = velri_os_monotonic_ns(), elapsed;
+        size_t count = 0U;
+        do {
+            check_ok(velri_slot_run(slot, nullptr, nullptr), "run");
+            ++count;
+            elapsed = velri_os_monotonic_ns() - start;
+        } while (elapsed < 100000000U);
+        times[s] = (double)elapsed * 1e-6 / (double)(count * batch_reps);
     }
-    double avg_ms = ((double)(velri_os_monotonic_ns() - t0) * 1e-6) / (3.0 * (double)batch_reps);
+    qsort(times, 5U, sizeof(*times), compare_times);
 
     velri_slot_destroy(slot);
     velri_plan_destroy(plan);
     velri_graph_destroy(g);
-    velri_os_aligned_free(hx); velri_os_aligned_free(hw); velri_os_aligned_free(hy);
+    velri_os_aligned_free(hx); velri_os_aligned_free(hw);
     velri_os_aligned_free(hxs); velri_os_aligned_free(hws);
-    return avg_ms;
+    return times[2];
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    bool decode = argc == 2 && strcmp(argv[1], "--decode") == 0;
+    if (argc != 1 && !decode) {
+        fprintf(stderr, "usage: %s [--decode]\n", argv[0]);
+        return 2;
+    }
     velri_context_config cfg = {.cpu_workers = 1U, .cpu_variant = VELRI_CPU_AUTO, .enable_vulkan = true};
     velri_context *ctx = nullptr;
     check_ok(velri_context_create(&cfg, &ctx), "ctx");
 
     velri_device_id vk_dev = 0U;
     if (velri_context_find_device(ctx, "vulkan", 0U, &vk_dev) != VELRI_OK) {
-        printf("No Vulkan 1.3 GPU found.\n");
+        fprintf(stderr, "No Vulkan 1.3 GPU found.\n");
+        velri_context_destroy(ctx);
+        return decode ? 1 : 0;
+    }
+
+    struct {
+        const char *name;
+        velri_linear_desc desc;
+    } modes[] = {
+        {"F32", velri_desc_f32()},
+        {"F16->F32", velri_desc_f16(VELRI_DTYPE_F32)},
+        {"BF16->F32", velri_desc_bf16(VELRI_DTYPE_F32)},
+        {"W8A8->F32", velri_desc_w8a8_f32()},
+    };
+
+    if (decode) {
+        decode_csv_header();
+        for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
+            for (size_t j = 0; j < sizeof(decode_shapes) / sizeof(decode_shapes[0]); ++j) {
+                size_t weights = decode_shapes[j].stream ? 3U : 1U;
+                uint32_t reps = decode_shapes[j].stream ? 9U : 8U;
+                double ms = bench_vk_linear_ms(ctx, vk_dev, modes[i].desc, decode_shapes[j].rows,
+                                               decode_shapes[j].m, decode_shapes[j].k, reps, weights);
+                if (ms > 0.0) decode_csv_row(modes[i].name, modes[i].desc, j, weights, ms);
+                else fprintf(stderr, "unsupported: %s at %zu rows\n", modes[i].name, decode_shapes[j].rows);
+            }
+        }
         velri_context_destroy(ctx);
         return 0;
     }
@@ -428,26 +480,14 @@ int main(void) {
     printf("  VRAM Copy BW (256->256 MiB) : %7.1f GB/s\n", ceil.bw_copy_gbps);
     printf("  FP32 FMA Peak               : %7.2f TFLOPS\n", ceil.fma_f32_tflops);
 
-    struct {
-        const char *name;
-        velri_linear_desc desc;
-    } modes[] = {
-        {"F32", velri_desc_f32()},
-        {"F16->F32", velri_desc_f16(VELRI_DTYPE_F32)},
-        {"BF16->F32", velri_desc_bf16(VELRI_DTYPE_F32)},
-        {"W8A8->F32", velri_desc_w8a8_f32()},
-    };
-
     printf("\n=== Vulkan GEMV (rows=1, M=14336, K=4096) ===\n");
     printf("%-11s | %8s | %11s | %10s\n", "Mode", "Time ms", "Eff GB/s", "%Meas Read");
     printf("------------+----------+-------------+-----------\n");
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
         velri_linear_desc d = modes[i].desc;
-        double ms = bench_vk_linear_ms(ctx, vk_dev, d, 1U, 14336U, 4096U, 16U);
+        double ms = bench_vk_linear_ms(ctx, vk_dev, d, 1U, 14336U, 4096U, 15U, 3U);
         if (ms <= 0.0) continue;
-        double bytes = (double)(14336U * 4096U * velri_dtype_bytes(d.w_dtype) +
-                                4096U * velri_dtype_bytes(d.x_dtype) +
-                                14336U * velri_dtype_bytes(d.y_dtype));
+        double bytes = (double)linear_logical_bytes(d, 1U, 14336U, 4096U);
         double gbps = bytes / (ms * 1e-3) / 1e9;
         printf("%-11s | %8.4f | %6.1f GB/s | %9.1f%%\n", modes[i].name, ms, gbps,
                ceil.bw_read_gbps > 0.0 ? 100.0 * gbps / ceil.bw_read_gbps : 0.0);
@@ -459,7 +499,7 @@ int main(void) {
     double ops = 2.0 * 2048.0 * 2048.0 * 2048.0;
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
         velri_linear_desc d = modes[i].desc;
-        double ms = bench_vk_linear_ms(ctx, vk_dev, d, 2048U, 2048U, 2048U, 8U);
+        double ms = bench_vk_linear_ms(ctx, vk_dev, d, 2048U, 2048U, 2048U, 8U, 1U);
         if (ms <= 0.0) continue;
         double tops = ops / (ms * 1e-3) / 1e12;
         printf("%-11s | %8.3f | %6.2f %s\n", modes[i].name, ms, tops,

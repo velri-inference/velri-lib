@@ -184,4 +184,5 @@ public struct LinearArgs<TXStorage, TWStorage, TYStorage> {
     public uint y_stride;
     public uint flags;
     public uint split_k;
+    public Ptr<float> residual; // Optional in-place addition after a W8A8 decode projection.
 };

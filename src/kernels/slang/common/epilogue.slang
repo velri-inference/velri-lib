@@ -5,6 +5,19 @@ public static const uint kEpFlagBias = 1u;
 public static const uint kEpFlagXScale = 2u;
 public static const uint kEpFlagWScale = 4u;
 
+// CPU linear execution flags (bits 3..5; mirrored in cpu_backend.c).
+public static const uint kLinearFlagDirectOrder = 1u << 3u;
+public static const uint kLinearFlagStreamWeights = 1u << 4u;
+public static const uint kLinearFlagAlignedWeights = 1u << 5u;
+
+// Raw W8A8 decode switches to sequential single-channel streaming above this slice size.
+public static const uint kW8A8StreamMinK = 1024u;
+public static const uint kW8A8StreamMinBytes = 131072u;
+
+[ForceInline] public bool w8a8_should_stream_rows(bool direct_order, uint width, uint k) {
+    return !direct_order && k >= kW8A8StreamMinK && width > (kW8A8StreamMinBytes / k);
+}
+
 public struct EpilogueParams {
     public Ptr<float, Access.Read> bias;
     public Ptr<float, Access.Read> x_scale;
@@ -31,11 +44,16 @@ public EpilogueParams make_epilogue_params(
 }
 
 public interface IEpilogue {
+    static bool isIdentity(EpilogueParams ep);
     static float apply(float acc, uint row, uint col, EpilogueParams ep);
 }
 
 // Standard linear epilogue: optional bias[col].
 public struct EpBias : IEpilogue {
+    [ForceInline] public static bool isIdentity(EpilogueParams ep) {
+        return ep.has_bias == 0u;
+    }
+
     public static float apply(float acc, uint row, uint col, EpilogueParams ep) {
         if (ep.has_bias != 0u) {
             acc += ep.bias[col];
@@ -46,6 +64,10 @@ public struct EpBias : IEpilogue {
 
 // Quantized scale epilogue: supports both W8A32 (w_scale) and W8A8 (x_scale * w_scale) + bias.
 public struct EpQuantScale : IEpilogue {
+    [ForceInline] public static bool isIdentity(EpilogueParams ep) {
+        return (ep.has_bias | ep.has_x_scale | ep.has_w_scale) == 0u;
+    }
+
     [ForceInline] public static float apply_scales(float acc, float w_scale, float x_scale) {
         return acc * (w_scale * x_scale);
     }

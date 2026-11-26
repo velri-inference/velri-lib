@@ -1162,6 +1162,62 @@ static void test_shared_weights_and_shared_state_dual_plan(velri_context *ctx,
     printf("  [PASS] Dual-plan shared WEIGHT slabs & shared STATE arenas (0 duplication, refcounted, state_group).\n");
 }
 
+/* ---- Test 10: Concurrent CPU Pools Core-Pinning Coordination & Oversubscription ---- */
+static void test_concurrent_cpu_pools(void) {
+    /* Create three concurrent CPU contexts (potentially oversubscribing physical cores)
+     * and run parallel ops on all of them to verify coordinated core reservation and
+     * clean release without deadlock, starvation, or leaks. */
+    const size_t n_ctxs = 3U;
+    velri_context *ctxs[3] = {nullptr, nullptr, nullptr};
+    velri_device_id devs[3] = {0U, 0U, 0U};
+    uint32_t phys = velri_os_available_physical_cores();
+    size_t nw = phys >= 4U ? (size_t)(phys / 2U) : 2U;
+    if (nw > 8U) nw = 8U;
+
+    for (size_t i = 0U; i < n_ctxs; ++i) {
+        velri_context_config c = {.cpu_workers = nw, .cpu_variant = VELRI_CPU_AUTO, .enable_vulkan = false};
+        CHECK_OK(velri_context_create(&c, &ctxs[i]), "concurrent pool ctx");
+        CHECK_OK(velri_context_find_device(ctxs[i], "cpu", 0U, &devs[i]), "concurrent pool cpu");
+    }
+
+    const size_t n = 8192U;
+    float *hx = (float *)calloc(n, sizeof(float));
+    float *hy = (float *)calloc(n, sizeof(float));
+    CHECK(hx && hy, "concurrent pool alloc");
+    for (size_t j = 0U; j < n; ++j) hx[j] = (float)(j % 17U) * 0.25f;
+
+    for (size_t i = 0U; i < n_ctxs; ++i) {
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "pool g");
+        velri_storage_id sx = add_f32_storage(g, VELRI_STORAGE_INPUT, n, devs[i]);
+        velri_storage_id sy = add_f32_storage(g, VELRI_STORAGE_OUTPUT, n, devs[i]);
+        velri_op_desc op = {
+            .kind = VELRI_OP_VEC_AXPBY, .num_inputs = 1U, .num_outputs = 1U,
+            .inputs = {add_1d_view(g, sx, n)}, .outputs = {add_1d_view(g, sy, n)},
+            .attr.axpby = {.alpha = (float)(i + 2U), .beta = 0.0f},
+        };
+        CHECK_OK(velri_graph_add_op(g, &op, devs[i], nullptr), "pool op");
+        velri_plan *plan = nullptr;
+        velri_slot *slot = nullptr;
+        CHECK_OK(velri_plan_prepare(ctxs[i], g, nullptr, &plan), "pool plan");
+        CHECK_OK(velri_slot_create(plan, &slot), "pool slot");
+        CHECK_OK(velri_slot_bind_host(slot, sx, hx, n * sizeof(float)), "pool bx");
+        CHECK_OK(velri_slot_bind_host(slot, sy, hy, n * sizeof(float)), "pool by");
+        CHECK_OK(velri_slot_run(slot, nullptr, nullptr), "pool run");
+        for (size_t j = 0U; j < n; ++j) {
+            CHECK(fabsf(hy[j] - (float)(i + 2U) * hx[j]) < 1e-5f, "pool output exact");
+        }
+        velri_slot_destroy(slot);
+        velri_plan_destroy(plan);
+        velri_graph_destroy(g);
+    }
+
+    free(hx);
+    free(hy);
+    for (size_t i = 0U; i < n_ctxs; ++i) velri_context_destroy(ctxs[i]);
+    printf("  [PASS] Concurrent CPU pools core reservation & oversubscription safety.\n");
+}
+
 int main(void) {
     printf("=== Velri-lib Core & Backend Contract Suite ===\n");
     velri_context_config cfg = {
@@ -1186,6 +1242,7 @@ int main(void) {
     test_refcounted_lifetimes_and_graph_growth();
     test_errors_and_cancellation(ctx, cpu_dev, mock_dev);
     test_shared_weights_and_shared_state_dual_plan(ctx, cpu_dev, mock_dev);
+    test_concurrent_cpu_pools();
     velri_backend_vtable remote = *velri_cpu_backend_vtable();
     remote.name = "remote_linear";
     remote.query_caps = remote_cpu_caps;

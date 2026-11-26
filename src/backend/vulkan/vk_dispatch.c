@@ -94,6 +94,10 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         if (rows <= 2U && plan.alt_pipe_id >= 0) {
             active_pipe_id = plan.alt_pipe_id;
         }
+        if (plan.short_w8a8 && rows == 64U && ((ib[0] | ib[1]) & 15U) == 0U &&
+            dev->pipes[PIPE_GEMM_SHORT_W8A8]) {
+            active_pipe_id = PIPE_GEMM_SHORT_W8A8;
+        }
         if (active_pipe_id == PIPE_GEMM_F32 && op->raw.attr.linear.allow_f16_matmul &&
             dev->pipes[PIPE_GEMM_F32_AS_F16] && velri_vk_mixed_gemm_fits(dev, rows, m)) {
             active_pipe_id = PIPE_GEMM_F32_AS_F16;
@@ -150,6 +154,9 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
                    active_pipe_id == PIPE_GEMV_BF16 || active_pipe_id == PIPE_GEMV_W8A8) {
             gx = velri_div_ceil_u32(m, warps_per_wg);
             gy = rows;
+        } else if (active_pipe_id == PIPE_GEMM_SHORT_W8A8) {
+            gx = m / 32U;
+            gy = 1U;
         } else if (active_pipe_id == PIPE_GEMM_SHORT_F32 ||
                    active_pipe_id == PIPE_GEMM_F32_AS_F16 ||
                    active_pipe_id == PIPE_GEMM_COOPMAT_F16_64 ||

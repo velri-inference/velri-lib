@@ -1,5 +1,7 @@
 #include "core_internal.h"
 #include "pool.h"
+#include "w8a8.h"
+#include "w8a8_layout.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -18,7 +20,10 @@
 enum {
     CPU_MIN_ALIGN_BYTES        = 64U,
     CPU_GEMV_ROW_THRESHOLD     = 4U,
-    CPU_W8A8_DIRECT_ORDER      = 1U << 3, /* kDirectOrder in w8a8_dot.slang */
+    CPU_W8A8_DIRECT_ORDER      = 1U << 3, /* kLinearFlagDirectOrder in epilogue.slang */
+    CPU_LINEAR_STREAM_WEIGHTS  = 1U << 4, /* kLinearFlagStreamWeights in epilogue.slang */
+    CPU_LINEAR_ALIGNED_WEIGHTS = 1U << 5, /* kLinearFlagAlignedWeights in epilogue.slang */
+    CPU_GEMV_STREAM_MIN_K      = 256U,
     CPU_GEMM_ROW_BLOCK         = 6U,
     CPU_GEMM_COL_ALIGN_SMALL   = 4U,
     CPU_GEMM_COL_ALIGN_MED     = 16U,
@@ -167,6 +172,9 @@ struct velri_backend_device {
     velri_pool *pool;
     size_t workers;
     const slang_cpu_vtable *vt;
+#if VELRI_C23_W8A8
+    const velri_w8a8_kernel *w8a8;
+#endif
     atomic_flag pool_busy;
 };
 
@@ -208,11 +216,17 @@ static velri_status cpu_open_device(uint32_t local_index, const void *cfg,
     if (nw == 0U) {
         if (ocfg && ocfg->use_physical_cores) {
             uint32_t cores = velri_os_available_physical_cores();
-            nw = cores > ocfg->reserve_cores ? cores - ocfg->reserve_cores : 1U;
-        } else {
+            if (cores > 0U) {
+                nw = cores > ocfg->reserve_cores ? cores - ocfg->reserve_cores : 1U;
+            }
+        }
+        if (nw == 0U) {
             const velri_cpu_info *ci = velri_get_cpu_info();
             int hw = ci->hardware_threads > 0 ? ci->hardware_threads : 1;
             nw = (size_t)(hw > 16 ? hw / 2 : hw);
+            if (ocfg && ocfg->use_physical_cores && ocfg->reserve_cores > 0U) {
+                nw = nw > ocfg->reserve_cores ? nw - ocfg->reserve_cores : 1U;
+            }
         }
         if (nw > (size_t)VELRI_POOL_MAX_WORKERS) {
             nw = (size_t)VELRI_POOL_MAX_WORKERS;
@@ -220,6 +234,16 @@ static velri_status cpu_open_device(uint32_t local_index, const void *cfg,
     }
     dev->workers = nw;
     dev->vt = vt;
+#if VELRI_C23_W8A8
+    dev->w8a8 = &velri_w8a8_portable;
+#if VELRI_X86_VARIANTS
+    velri_cpu_variant variant = velri_cpu_resolve_variant(req_var);
+    if (variant == VELRI_CPU_AVX2 || variant == VELRI_CPU_AVX512)
+        dev->w8a8 = &velri_w8a8_avx2;
+    if (variant == VELRI_CPU_AVX512 && velri_get_cpu_info()->has_avx512_vnni)
+        dev->w8a8 = &velri_w8a8_vnni;
+#endif
+#endif
     atomic_flag_clear(&dev->pool_busy);
 
     if (nw > 1U) {
@@ -333,7 +357,6 @@ static velri_status cpu_query_operation(const velri_backend_device *dev,
     return st;
 }
 
-enum { W8A8_PANEL_WIDTH = 32 };
 struct velri_prepared_op { bool packed_w8a8; };
 static const velri_prepared_op cpu_packed_w8a8 = {.packed_w8a8 = true};
 
@@ -346,11 +369,12 @@ static bool cpu_describe_weight(const velri_backend_device *dev, const velri_res
     size_t channels;
     if (w->byte_offset != 0 || w->strides[1] != 1 || w->strides[0] > UINT32_MAX ||
         w->dims[0] > UINT32_MAX || w->dims[1] > UINT32_MAX ||
-        velri_align_up_overflow(w->dims[0], W8A8_PANEL_WIDTH, &channels) ||
+        velri_align_up_overflow(w->dims[0], VELRI_W8A8_SIGNED_PANEL_WIDTH, &channels) ||
         velri_mul_overflow_size(channels, w->dims[1], &out->bytes))
         return false;
 #if VELRI_HAS_SLANG_CPU_DOT
-    if (dev->vt == &g_vt_avx512_dot) {
+    if (dev->vt == &g_vt_avx512_dot &&
+        !(VELRI_C23_W8A8 && velri_w8a8_panel_shape(w->dims[0], w->dims[1]))) {
         size_t native_bytes;
         if (velri_mul_overflow_size(w->dims[0], velri_slang_dot_packed_stride((uint32_t)w->dims[1]),
                                     &native_bytes)) return false;
@@ -367,6 +391,12 @@ static bool cpu_describe_weight(const velri_backend_device *dev, const velri_res
 
 static void cpu_pack_weight(const velri_backend_device *dev, const velri_weight_packing *p,
                             const void *source, void *dst) {
+#if VELRI_C23_W8A8
+    if (dev->w8a8->pack && velri_w8a8_panel_shape(p->channels, p->depth)) {
+        dev->w8a8->pack(source, p->stride, p->channels, p->depth, dst);
+        return;
+    }
+#endif
     dev->vt->pack_w8a8(source, p->stride, p->channels, p->depth, dst);
 }
 
@@ -381,6 +411,9 @@ const velri_device_hooks velri_cpu_device_hooks = {
 typedef struct {
     const slang_cpu_vtable *vt;
     bool packed_w8a8;
+#if VELRI_C23_W8A8
+    const velri_w8a8_kernel *w8a8;
+#endif
     const velri_resolved_op *op;
     const velri_buffer_binding *in_b;
     const velri_buffer_binding *out_b;
@@ -395,10 +428,9 @@ typedef struct {
     uint32_t linear_flags;
 } cpu_dispatch_ctx;
 
-#if VELRI_HAS_SLANG_CPU_DOT
 /* Physical host bindings can overlap even when the graph uses separate storage IDs.
    Keep the direct tile traversal when writes could change a later input read. */
-static bool cpu_w8a8_output_overlaps_input(const velri_submit_item *item, size_t packed_bytes) {
+static bool cpu_linear_output_overlaps_input(const velri_submit_item *item, size_t packed_bytes) {
     const velri_resolved_op *op = item->op;
     size_t start, end;
     if (velri_tensor_view_byte_span(&op->outputs[0], &start, &end) != VELRI_OK) return true;
@@ -418,7 +450,6 @@ static bool cpu_w8a8_output_overlaps_input(const velri_submit_item *item, size_t
     }
     return false;
 }
-#endif
 
 static void cpu_kv_append_worker(void *vctx, size_t wid, size_t nw) {
     const cpu_dispatch_ctx *c = (const cpu_dispatch_ctx *)vctx;
@@ -516,9 +547,20 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
             break;
         case VELRI_LIN_F64:
             vt->linear_f64((const double *)x, xs, (const double *)w, ws, (const double *)bias,
-                           bias ? VELRI_EP_FLAG_BIAS : 0U, (double *)y, ys, r0, r1, c0, c1, k);
+                           flags, (double *)y, ys, r0, r1, c0, c1, k);
             break;
         case VELRI_LIN_W8A8_F32:
+#if VELRI_C23_W8A8
+            if (c->w8a8) {
+                bool native_layout = c->packed_w8a8 && c->w8a8->pack;
+                bool direct = (flags & CPU_W8A8_DIRECT_ORDER) != 0;
+                if (native_layout || (!direct && r1 - r0 >= CPU_GEMV_ROW_THRESHOLD)) {
+                    c->w8a8->run(x, xs, w, ws, c->packed_w8a8, bias, xsc, wsc, y, ys,
+                                 r0, r1, c0, c1, k, direct);
+                    break;
+                }
+            }
+#endif
             if (c->packed_w8a8) {
                 vt->linear_w8a8_f32_packed(x, xs, w, bias, xsc, wsc, flags, y, ys,
                                            r0, r1, c0, c1, k);
@@ -838,18 +880,33 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
             return st;
         }
         ctx.linear_flags = velri_op_linear_epilogue_flags(op);
+#if VELRI_X86_VARIANTS
+        if (ctx.linear_mode != VELRI_LIN_W8A8_F32 && ctx.active_rows == 1U && dev->vt != &g_vt_base &&
+            op->inputs[1].dims[1] >= CPU_GEMV_STREAM_MIN_K &&
+            op->inputs[1].strides[0] == op->inputs[1].dims[1] &&
+            !cpu_linear_output_overlaps_input(item, 0U))
+            ctx.linear_flags |= CPU_LINEAR_STREAM_WEIGHTS;
+#endif
+        if (ctx.linear_mode != VELRI_LIN_W8A8_F32) {
+            size_t vec4_align_mask = 4U * velri_dtype_bytes(op->inputs[1].dtype) - 1U;
+            if ((((uintptr_t)velri_binding_cptr(&item->inputs[1]) & vec4_align_mask) == 0U) &&
+                ((op->inputs[1].strides[0] & 3U) == 0U))
+                ctx.linear_flags |= CPU_LINEAR_ALIGNED_WEIGHTS;
+        }
         ctx.packed_w8a8 = item->prepared == &cpu_packed_w8a8;
         velri_weight_packing packing = {0};
         if (ctx.packed_w8a8 &&
             (!cpu_describe_weight(dev, op, 1U, &packing) ||
              !velri_binding_range_valid(&item->inputs[1], packing.bytes)))
             return VELRI_ERR_INVALID;
-#if VELRI_HAS_SLANG_CPU_DOT
-        if (ctx.linear_mode == VELRI_LIN_W8A8_F32 && dev->vt == &g_vt_avx512_dot &&
-            ctx.active_rows >= CPU_GEMV_ROW_THRESHOLD &&
-            cpu_w8a8_output_overlaps_input(item, packing.bytes))
-            ctx.linear_flags |= CPU_W8A8_DIRECT_ORDER;
+#if VELRI_C23_W8A8
+        if (ctx.linear_mode == VELRI_LIN_W8A8_F32 &&
+            velri_w8a8_panel_shape(op->inputs[1].dims[0], op->inputs[1].dims[1]))
+            ctx.w8a8 = dev->w8a8;
 #endif
+        if (ctx.linear_mode == VELRI_LIN_W8A8_F32 &&
+            cpu_linear_output_overlaps_input(item, packing.bytes))
+            ctx.linear_flags |= CPU_W8A8_DIRECT_ORDER;
         work_units = 2U; /* Always parallelize across M or rows */
         break;
     }

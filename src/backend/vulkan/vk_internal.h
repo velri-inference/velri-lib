@@ -86,6 +86,7 @@ enum {
     PIPE_SOFTMAX_F32,
     PIPE_FWHT_F32,
     PIPE_QUANTIZE_ROW_F32_I8,
+    PIPE_RMS_QUANT,
     PIPE_GEMV_F32,
     PIPE_QKV_ROPE_CACHE_F32,
     PIPE_QKV_ROPE_CACHE_F16KV,
@@ -97,6 +98,7 @@ enum {
     PIPE_GEMV_F16,
     PIPE_GEMV_BF16,
     PIPE_GEMV_W8A8,
+    PIPE_QUANT_GEMV_W8A8,
     PIPE_GEMM_F32,
     PIPE_GEMM_SHORT_F32,
     PIPE_GEMV_ROWS_F32,
@@ -108,6 +110,7 @@ enum {
     PIPE_GEMM_F32_AS_F16,
     PIPE_GEMM_COOPMAT_BF16_64,
     PIPE_GEMM_COOPMAT_W8A8_64,
+    PIPE_GEMM_SHORT_W8A8,
     PIPE_EMBEDDING_F32,
     PIPE_COPY_LAST_ROW_F32,
     PIPE_KV_APPEND_F32,
@@ -134,6 +137,8 @@ enum {
     PIPE_ATTENTION_MERGE64_F32,
     PIPE_BATCHED_LINEAR_NT_F32,
     PIPE_BATCHED_LINEAR_NN_F32,
+    PIPE_GATED_W8A8,
+    PIPE_QKV_ROPE_W8A8,
     PIPE_COUNT
 };
 
@@ -259,6 +264,7 @@ struct velri_prepared_op {
     int alt_pipe_id;                /* LINEAR: GEMV pipeline for dynamic active_rows <= 2 */
     int reduce_pipe_id;             /* LINEAR Split-K: PIPE_SPLITK_REDUCE */
     int stage2_decode_pipe_id;      /* ATTENTION: stage 2 decode/wide pipeline */
+    bool short_w8a8;
     bool flash_prefill;             /* Eligible layout; final addresses checked when encoding. */
     int stage2_prefill_pipe_id;     /* ATTENTION: PIPE_ATTENTION_PREFILL_F32 */
     int stage2_splitkv_pipe_id;     /* ATTENTION: PIPE_ATTENTION_SPLITKV_F32 */

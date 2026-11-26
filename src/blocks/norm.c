@@ -44,6 +44,14 @@ velri_tensor velri_block_norm(velri_builder *b, velri_tensor x, const char *pref
 velri_tensor velri_block_linear(velri_builder *b, velri_tensor x, const char *prefix,
                                 const char *proj_name, velri_dtype w_dtype, size_t out_dim,
                                 bool has_bias) {
+    velri_projection_input input = velri_blocks_projection_input(b, x, w_dtype);
+    return velri_blocks_project(b, input, prefix, proj_name, w_dtype, out_dim, has_bias);
+}
+
+velri_tensor velri_blocks_project(velri_builder *b, velri_projection_input input, const char *prefix,
+                                  const char *proj_name, velri_dtype w_dtype, size_t out_dim,
+                                  bool has_bias) {
+    velri_tensor x = input.values;
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
@@ -60,5 +68,8 @@ velri_tensor velri_block_linear(velri_builder *b, velri_tensor x, const char *pr
                                         x.dims[1], has_bias, &w, &bias)) {
         return VELRI_TENSOR_NONE;
     }
-    return velri_b_linear(b, x, w, bias);
+    velri_tensor scale = velri_blocks_weight_scale(b, prefix, proj_name, ".weight_scale", w);
+    const size_t dims[2] = {x.dims[0], out_dim};
+    velri_tensor out = velri_b_scratch(b, act_dtype, 2U, dims);
+    return velri_blocks_linear_into(b, input, w, bias, scale, out);
 }

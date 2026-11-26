@@ -231,6 +231,26 @@ uint32_t velri_os_available_physical_cores(void) {
     return count;
 }
 
+velri_os_pin_plan *velri_os_pin_acquire(size_t num_workers) {
+    (void)num_workers;
+    return nullptr;
+}
+
+void velri_os_pin_release(velri_os_pin_plan *plan) { (void)plan; }
+
+void velri_os_pin_worker(const velri_os_pin_plan *plan, size_t worker_id) {
+    (void)plan;
+    (void)worker_id;
+}
+
+void velri_os_caller_guard_enter(velri_os_pin_plan *plan, velri_os_affinity_guard *guard) {
+    (void)plan;
+    guard->plan = nullptr;
+    guard->active = false;
+}
+
+void velri_os_caller_guard_leave(const velri_os_affinity_guard *guard) { (void)guard; }
+
 void velri_os_cpu_relax(void) { YieldProcessor(); }
 
 size_t velri_os_ctz64(uint64_t x) {

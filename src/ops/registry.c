@@ -193,22 +193,6 @@ static velri_status validate_norm_op(const velri_resolved_op *op, float eps, boo
     return VELRI_OK;
 }
 
-static velri_status check_rope_table_bounds(const velri_resolved_op *op, size_t active_t,
-                                            size_t pos) {
-    size_t end_pos = 0U, need = 0U;
-    if (!fits_u32(pos) || velri_add_overflow_size(pos, active_t, &end_pos) ||
-        velri_mul_overflow_size(end_pos, op->raw.attr.rope.rotary_dim / 2U, &need)) {
-        return VELRI_ERR_OVERFLOW;
-    }
-    size_t ct_n = 0U, st_n = 0U;
-    if (velri_tensor_view_num_elements(&op->inputs[1], &ct_n) != VELRI_OK ||
-        velri_tensor_view_num_elements(&op->inputs[2], &st_n) != VELRI_OK ||
-        ct_n < need || st_n < need) {
-        return VELRI_ERR_INVALID;
-    }
-    return VELRI_OK;
-}
-
 static velri_status check_embedding_pos_bounds(const velri_resolved_op *op, size_t active_t,
                                                size_t pos) {
     size_t end_pos = 0U;
@@ -314,8 +298,7 @@ velri_status velri_op_validate(const velri_resolved_op *op) {
             ct->dtype != VELRI_DTYPE_F32 || st->dtype != VELRI_DTYPE_F32) {
             return VELRI_ERR_INVALID;
         }
-        velri_status tbl_st =
-            check_rope_table_bounds(op, x->dims[0], op->raw.attr.rope.pos_offset);
+        velri_status tbl_st = velri_op_resolve_rope_step(op, nullptr, nullptr, nullptr);
         if (tbl_st != VELRI_OK) {
             return tbl_st;
         }

@@ -275,16 +275,17 @@ velri_tensor velri_block_dense_attention(velri_builder *b, velri_tensor x, const
     velri_tensor k = VELRI_TENSOR_NONE;
     velri_tensor v = VELRI_TENSOR_NONE;
 
+    velri_projection_input input = velri_blocks_projection_input(b, x, spec->dtype);
     if (spec->fused_qkv) {
         velri_tensor qkv =
-            velri_block_linear(b, x, prefix, spec->qkv_name, spec->dtype, qkv_dim, spec->qkv_bias);
+            velri_blocks_project(b, input, prefix, spec->qkv_name, spec->dtype, qkv_dim, spec->qkv_bias);
         q = velri_b_subview_2d_cols(b, qkv, 0U, q_dim);
         k = velri_b_subview_2d_cols(b, qkv, q_dim, kv_dim);
         v = velri_b_subview_2d_cols(b, qkv, q_dim + kv_dim, kv_dim);
     } else {
-        q = velri_block_linear(b, x, prefix, spec->q_name, spec->dtype, q_dim, spec->qkv_bias);
-        k = velri_block_linear(b, x, prefix, spec->k_name, spec->dtype, kv_dim, spec->qkv_bias);
-        v = velri_block_linear(b, x, prefix, spec->v_name, spec->dtype, kv_dim, spec->qkv_bias);
+        q = velri_blocks_project(b, input, prefix, spec->q_name, spec->dtype, q_dim, spec->qkv_bias);
+        k = velri_blocks_project(b, input, prefix, spec->k_name, spec->dtype, kv_dim, spec->qkv_bias);
+        v = velri_blocks_project(b, input, prefix, spec->v_name, spec->dtype, kv_dim, spec->qkv_bias);
     }
     if (b->err != VELRI_OK) {
         goto cleanup;

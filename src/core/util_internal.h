@@ -13,6 +13,9 @@
  * (overflow-checked arithmetic, alignment, strict-aliasing-safe dynamic vectors, refcounts).
  */
 
+velri_status velri_shape_byte_size(velri_dtype dtype, uint32_t rank, const size_t *dims,
+                                   size_t *out_bytes);
+
 static inline bool velri_is_pow2(size_t x) { return x != 0U && (x & (x - 1U)) == 0U; }
 
 static inline bool velri_mul_overflow_size(size_t a, size_t b, size_t *out) {

@@ -31,6 +31,7 @@ static const vk_pipe_spec k_pipes[PIPE_COUNT] = {
     [PIPE_VEC_MUL_F32]           = {spv_vk_vec_mul_f32, spv_vk_vec_mul_f32_bytes, VK_CAP_NONE},
     [PIPE_SOFTMAX_F32]           = {spv_vk_softmax_f32, spv_vk_softmax_f32_bytes, VK_CAP_NONE},
     [PIPE_FWHT_F32]              = {spv_vk_fwht_f32, spv_vk_fwht_f32_bytes, VK_CAP_F16_I8},
+    [PIPE_RMS_QUANT]             = {spv_vk_rms_quant, spv_vk_rms_quant_bytes, VK_CAP_F16_I8},
     [PIPE_QUANTIZE_ROW_F32_I8]   = {spv_vk_quantize_row_f32_i8, spv_vk_quantize_row_f32_i8_bytes, VK_CAP_F16_I8},
     [PIPE_QKV_ROPE_CACHE_F32] = {spv_vk_qkv_rope_cache_f32, spv_vk_qkv_rope_cache_f32_bytes, VK_CAP_NONE},
     [PIPE_QKV_ROPE_CACHE_F16KV] = {spv_vk_qkv_rope_cache_f16kv, spv_vk_qkv_rope_cache_f16kv_bytes, VK_CAP_F16_KV},
@@ -42,6 +43,9 @@ static const vk_pipe_spec k_pipes[PIPE_COUNT] = {
     [PIPE_GEMV_F32]              = {spv_vk_gemv_f32, spv_vk_gemv_f32_bytes, VK_CAP_NONE},
     [PIPE_GEMV_F16]              = {spv_vk_gemv_f16, spv_vk_gemv_f16_bytes, VK_CAP_F16_I8},
     [PIPE_GEMV_BF16]             = {spv_vk_gemv_bf16, spv_vk_gemv_bf16_bytes, VK_CAP_INT16},
+    [PIPE_GATED_W8A8] = {spv_vk_gated_w8a8, spv_vk_gated_w8a8_bytes, VK_CAP_F16_I8 | VK_CAP_INT_DOT},
+    [PIPE_QKV_ROPE_W8A8] = {spv_vk_qkv_rope_w8a8, spv_vk_qkv_rope_w8a8_bytes, VK_CAP_F16_I8 | VK_CAP_INT_DOT},
+    [PIPE_QUANT_GEMV_W8A8] = {spv_vk_quant_gemv_w8a8, spv_vk_quant_gemv_w8a8_bytes, VK_CAP_F16_I8 | VK_CAP_INT_DOT},
     [PIPE_GEMV_W8A8]             = {spv_vk_gemv_w8a8, spv_vk_gemv_w8a8_bytes, VK_CAP_F16_I8 | VK_CAP_INT_DOT},
     [PIPE_GEMM_SHORT_F32]        = {spv_vk_gemm_short_f32, spv_vk_gemm_short_f32_bytes, VK_CAP_F32_GEMM},
     [PIPE_GEMV_ROWS_F32]         = {spv_vk_gemv_rows_f32, spv_vk_gemv_rows_f32_bytes, VK_CAP_NONE},
@@ -53,6 +57,7 @@ static const vk_pipe_spec k_pipes[PIPE_COUNT] = {
     [PIPE_GEMM_COOPMAT_F16_64]   = {spv_vk_gemm_coopmat_f16_64, spv_vk_gemm_coopmat_f16_64_bytes, VK_CAP_CM_F16},
     [PIPE_GEMM_F32_AS_F16]       = {spv_vk_gemm_f32_as_f16, spv_vk_gemm_f32_as_f16_bytes, VK_CAP_CM_F16},
     [PIPE_GEMM_COOPMAT_BF16_64]  = {spv_vk_gemm_coopmat_bf16_64, spv_vk_gemm_coopmat_bf16_64_bytes, VK_CAP_CM_BF16},
+    [PIPE_GEMM_SHORT_W8A8]       = {spv_vk_gemm_short_w8a8, spv_vk_gemm_short_w8a8_bytes, VK_CAP_CM_I8},
     [PIPE_GEMM_COOPMAT_W8A8_64]  = {spv_vk_gemm_coopmat_w8a8_64, spv_vk_gemm_coopmat_w8a8_64_bytes, VK_CAP_CM_I8},
     [PIPE_EMBEDDING_F32]         = {spv_vk_embedding_f32, spv_vk_embedding_f32_bytes, VK_CAP_NONE},
     [PIPE_COPY_LAST_ROW_F32]     = {spv_vk_copy_last_row_f32, spv_vk_copy_last_row_f32_bytes, VK_CAP_NONE},
@@ -316,6 +321,7 @@ velri_status velri_vk_resolve_op_pipes(const velri_backend_device *dev, const ve
     out_plan->stage2_decode_pipe_id = -1;
     out_plan->stage2_prefill_pipe_id = -1;
     out_plan->flash_prefill = false;
+    out_plan->short_w8a8 = false;
     out_plan->stage2_splitkv_pipe_id = -1;
     out_plan->stage3_splitkv_reduce_pipe_id = -1;
     out_plan->split_k = 1U;
@@ -353,6 +359,11 @@ velri_status velri_vk_resolve_op_pipes(const velri_backend_device *dev, const ve
         case VELRI_LIN_W8A8_F32:
             select_coopmat_plan(dev, rows, m, PIPE_GEMV_W8A8, PIPE_GEMM_COOPMAT_W8A8_64,
                                 PIPE_GEMM_COOPMAT_W8A8, out_plan);
+            /* A 64x32 tile doubles the grid width and reads 128 contiguous bytes per K step. */
+            out_plan->short_w8a8 = has_pipe_caps(dev, PIPE_GEMM_SHORT_W8A8) &&
+                (rows == 64U || (rows > 64U && velri_op_is_dynamic_seq(op))) &&
+                m % 32U == 0U && m / 32U <= dev->max_wg_count[0] &&
+                k % 128U == 0U && ((op->inputs[0].strides[0] | op->inputs[1].strides[0]) & 15U) == 0U;
             break;
         case VELRI_LIN_F32X_BF16W:
         case VELRI_LIN_F64:
@@ -505,6 +516,9 @@ static void prepare_optional_pipes_locked(velri_backend_device *dev, const velri
             (void)velri_vk_get_pipe_locked(dev, PIPE_PREFILL_TILE_F32);
         }
     }
+    if (plan->short_w8a8) {
+        plan->short_w8a8 = velri_vk_get_pipe_locked(dev, PIPE_GEMM_SHORT_W8A8) != VK_NULL_HANDLE;
+    }
     if (plan->pipe_id == PIPE_GEMM_F32) {
         const velri_tensor_view *x = &op->inputs[0], *w = &op->inputs[1];
         const size_t k = x->dims[1];
@@ -536,7 +550,21 @@ static void prepare_optional_pipes_locked(velri_backend_device *dev, const velri
     if (dev->subgroup_size != 32U) {
         return;
     }
+    if (plan->pipe_id == PIPE_GEMV_W8A8 || plan->alt_pipe_id == PIPE_GEMV_W8A8) {
+        (void)velri_vk_get_pipe_locked(dev, PIPE_GATED_W8A8);
+        (void)velri_vk_get_pipe_locked(dev, PIPE_QKV_ROPE_W8A8);
+    }
     switch (plan->pipe_id) {
+    case PIPE_QUANTIZE_ROW_F32_I8: {
+        const velri_tensor_view *x = &op->inputs[0];
+        if ((x->dims[0] == 1U || velri_op_is_dynamic_seq(op)) &&
+            x->dims[1] <= 2048U && !(x->dims[1] & 3U)) {
+            (void)velri_vk_get_pipe_locked(dev, PIPE_RMS_QUANT);
+            if (!(x->dims[1] & 15U))
+                (void)velri_vk_get_pipe_locked(dev, PIPE_QUANT_GEMV_W8A8);
+        }
+        break;
+    }
     case PIPE_KV_APPEND_F16KV:
         if (op->inputs[0].dims[0] == 1U || velri_op_is_dynamic_seq(op)) {
             (void)velri_vk_get_pipe_locked(dev, PIPE_QKV_ROPE_CACHE_F16KV);

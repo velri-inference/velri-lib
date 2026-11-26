@@ -1,16 +1,20 @@
-// Vulkan Cooperative Matrix Shared-Memory GEMM (FP16, BF16, W8A8 x {128x128, 64x64}).
+// Vulkan cooperative matrix shared-memory GEMM for FP16, BF16 and W8A8.
 // Requires 32-lane subgroups (gated on subgroup_size == 32 in vk_device.c).
 import numeric;
 import epilogue;
 import vk_common;
 
-// Padded shared-memory row stride in uint4 (4 active + 1 padding to eliminate bank conflicts).
+// One extra uint4 per row avoids bank conflicts in subgroup matrix loads.
+static const uint kCmShortStrideU4 = 9u;
 static const uint kCmSmemStrideU4 = 5u;
 
 groupshared uint4 s_cm128_a[128u * kCmSmemStrideU4];
 groupshared uint4 s_cm128_b[128u * kCmSmemStrideU4];
 groupshared uint4 s_cm64_a[64u * kCmSmemStrideU4];
 groupshared uint4 s_cm64_b[64u * kCmSmemStrideU4];
+
+groupshared uint4 s_short_a[64u * kCmShortStrideU4];
+groupshared uint4 s_short_b[32u * kCmShortStrideU4];
 
 // A tile of eight elements occupies one uint4 after packing. With F32 inputs
 // the global tile is twice as large; conversion happens in registers.
@@ -58,6 +62,7 @@ uint4 load_u4_safe<let ELEM_BYTES : int, let PACK_F32 : bool>(
 }
 
 interface ICoopSmemTile<let WG_M : int, let WG_N : int, let WARP_M : int, let WARP_N : int> {
+    static const uint kStrideU4;
     static void storeA(uint idx, uint4 v);
     static void storeB(uint idx, uint4 v);
     static uint4 readA(uint idx);
@@ -70,15 +75,16 @@ interface ICoopSmemTile<let WG_M : int, let WG_N : int, let WARP_M : int, let WA
         uint off_u4);
 }
 
-#define DEFINE_COOP_SMEM(NAME, SMEM_A, SMEM_B, WGM, WGN, WM, WN)                                  \
+#define DEFINE_COOP_SMEM(NAME, SMEM_A, SMEM_B, WGM, WGN, WM, WN, STRIDE)                          \
 struct NAME : ICoopSmemTile<WGM, WGN, WM, WN> {                                                    \
+    static const uint kStrideU4 = STRIDE;                                                          \
     static void storeA(uint idx, uint4 v) { SMEM_A[idx] = v; }                                     \
     static void storeB(uint idx, uint4 v) { SMEM_B[idx] = v; }                                     \
     static uint4 readA(uint idx) { return SMEM_A[idx]; }                                           \
     static linalg::CoopMat<T, MemoryScope.Subgroup, 16, K_STEP, linalg::CoopMatMatrixUse.MatrixA>  \
         loadMatA<T : ICoopElement, let K_STEP : int>(uint off_u4)                                  \
     {                                                                                              \
-        uint lay = 0u, str = kCmSmemStrideU4;                                                      \
+        uint lay = 0u, str = kStrideU4;                                                            \
         return spirv_asm {                                                                         \
             OpExtension "SPV_KHR_cooperative_matrix";                                              \
             OpCapability CooperativeMatrixKHR;                                                     \
@@ -92,7 +98,7 @@ struct NAME : ICoopSmemTile<WGM, WGN, WM, WN> {                                 
     static linalg::CoopMat<T, MemoryScope.Subgroup, K_STEP, 16, linalg::CoopMatMatrixUse.MatrixB>  \
         loadMatB<T : ICoopElement, let K_STEP : int>(uint off_u4)                                  \
     {                                                                                              \
-        uint lay = 1u, str = kCmSmemStrideU4;                                                      \
+        uint lay = 1u, str = kStrideU4;                                                            \
         return spirv_asm {                                                                         \
             OpExtension "SPV_KHR_cooperative_matrix";                                              \
             OpCapability CooperativeMatrixKHR;                                                     \
@@ -119,8 +125,9 @@ struct NAME : ICoopSmemTile<WGM, WGN, WM, WN> {                                 
     }                                                                                              \
 }
 
-DEFINE_COOP_SMEM(CoopSmem128, s_cm128_a, s_cm128_b, 128, 128, 4, 2)
-DEFINE_COOP_SMEM(CoopSmem64,  s_cm64_a,  s_cm64_b,   64,  64, 2, 2)
+DEFINE_COOP_SMEM(CoopSmem128, s_cm128_a, s_cm128_b, 128, 128, 4, 2, kCmSmemStrideU4)
+DEFINE_COOP_SMEM(CoopSmem64,  s_cm64_a,  s_cm64_b,   64,  64, 2, 2, kCmSmemStrideU4)
+DEFINE_COOP_SMEM(CoopSmemShort, s_short_a, s_short_b, 64, 32, 1, 1, kCmShortStrideU4)
 
 void subgroup_smem_barrier() {
     uint sc = 3u;
@@ -155,9 +162,9 @@ void coopmat_load_ab<TMat : ICoopElement, let K_STEP : int,
     uint wr, uint wc, uint kk_u4)
 {
     [ForceUnroll] for (uint i = 0u; i < uint(WARP_M); ++i)
-        mA[i] = S::loadMatA<TMat, K_STEP>((wr * uint(WARP_M * 16) + i * 16u) * kCmSmemStrideU4 + kk_u4);
+        mA[i] = S::loadMatA<TMat, K_STEP>((wr * uint(WARP_M * 16) + i * 16u) * S::kStrideU4 + kk_u4);
     [ForceUnroll] for (uint j = 0u; j < uint(WARP_N); ++j)
-        mB[j] = S::loadMatB<TMat, K_STEP>((wc * uint(WARP_N * 16) + j * 16u) * kCmSmemStrideU4 + kk_u4);
+        mB[j] = S::loadMatB<TMat, K_STEP>((wc * uint(WARP_N * 16) + j * 16u) * S::kStrideU4 + kk_u4);
 }
 
 void coopmat_fma<TMat : ICoopElement, TAcc : ICoopElement, let K_STEP : int,
@@ -187,7 +194,7 @@ void coopmat_gemm_smem<TStorage : ICoopElement, TMat : ICoopElement, TAcc : ICoo
                        let K_STEP : int, let ELEM_BYTES : int, let IS_QUANT : int,
                        let WG_M : int, let WG_N : int, let WARP_M : int, let WARP_N : int,
                        let NTHREADS : int,
-                       S : ICoopSmemTile<WG_M, WG_N, WARP_M, WARP_N>>(
+                       S : ICoopSmemTile<WG_M, WG_N, WARP_M, WARP_N>, let SHORT_W8A8 : bool = false>(
     LinearArgs<TStorage, TStorage, float> a, TAcc zero_acc, uint3 gtid, uint3 gid)
 {
     static const bool pack_f32 = sizeof(TStorage) == 4;
@@ -214,7 +221,8 @@ void coopmat_gemm_smem<TStorage : ICoopElement, TMat : ICoopElement, TAcc : ICoo
     Ptr<uint8_t, Access.Read> xb = Ptr<uint8_t, Access.Read>(a.x);
     Ptr<uint8_t, Access.Read> wb = Ptr<uint8_t, Access.Read>(a.w);
     uint elems_per_u4 = uint(16 / ELEM_BYTES);
-    uint bk_elems = elems_per_u4 * 4u;
+    static const uint kDepthU4 = S::kStrideU4 - 1u;
+    uint bk_elems = elems_per_u4 * kDepthU4;
     uint num_k_tiles = (a.k + bk_elems - 1u) / bk_elems;
     bool aligned16 = is_ptr_aligned16(a.x) && is_ptr_aligned16(a.w) &&
                      (((a.x_stride * uint(sizeof(TStorage))) & 15u) == 0u) &&
@@ -222,25 +230,29 @@ void coopmat_gemm_smem<TStorage : ICoopElement, TMat : ICoopElement, TAcc : ICoo
     bool fast_interior = aligned16 && ((a.k & (bk_elems - 1u)) == 0u) &&
                          (row0 + wg_m_u <= a.rows) && (col0 + wg_n_u <= a.m);
 
-    static const uint kVecA = uint((WG_M * 4) / NTHREADS);
-    static const uint kVecB = uint((WG_N * 4) / NTHREADS);
-    static const uint kRowStep = uint(NTHREADS / 4);
-    uint lr0 = tid >> 2u;
-    uint lu0 = tid & 3u;
+    static const uint kVecA = uint((WG_M * kDepthU4) / NTHREADS);
+    static const uint kVecB = uint((WG_N * kDepthU4) / NTHREADS);
+    static const uint kRowStep = uint(NTHREADS / kDepthU4);
+    uint lr0 = tid / kDepthU4;
+    uint lu0 = tid % kDepthU4;
 
-    if (fast_interior && num_k_tiles > 0u) {
+    // The short W8A8 dispatcher requires full, aligned tiles in all three dimensions.
+    if (SHORT_W8A8 || (fast_interior && num_k_tiles > 0u)) {
         uint64_t x_off0 = (uint64_t(row0 + lr0) * uint64_t(a.x_stride) + uint64_t(lu0 * elems_per_u4)) * uint64_t(sizeof(TStorage));
         uint64_t w_off0 = (uint64_t(col0 + lr0) * uint64_t(a.w_stride) + uint64_t(lu0 * elems_per_u4)) * uint64_t(sizeof(TStorage));
         Ptr<uint4, Access.Read> xp0 = Ptr<uint4, Access.Read>(xb + x_off0);
         Ptr<uint4, Access.Read> wp0 = Ptr<uint4, Access.Read>(wb + w_off0);
         uint64_t x_step_u4 = (uint64_t(kRowStep) * uint64_t(a.x_stride)) / uint64_t(elems_per_u4);
         uint64_t w_step_u4 = (uint64_t(kRowStep) * uint64_t(a.w_stride)) / uint64_t(elems_per_u4);
-        uint s0 = lr0 * kCmSmemStrideU4 + lu0;
+        // Spread simultaneous reads across K panels for short integer projections.
+        uint first_tile = SHORT_W8A8 ? ((gid.x * 5u) % num_k_tiles) : 0u;
+        uint64_t first_u4 = uint64_t(first_tile) * kDepthU4;
+        uint s0 = lr0 * S::kStrideU4 + lu0;
 
         [ForceUnroll] for (uint v = 0u; v < kVecA; ++v)
-            S::storeA(s0 + v * (kRowStep * kCmSmemStrideU4), load_coop_tile<pack_f32>(xp0, uint64_t(v) * x_step_u4));
+            S::storeA(s0 + v * (kRowStep * S::kStrideU4), load_coop_tile<pack_f32>(xp0, uint64_t(v) * x_step_u4 + first_u4));
         [ForceUnroll] for (uint v = 0u; v < kVecB; ++v)
-            S::storeB(s0 + v * (kRowStep * kCmSmemStrideU4), load_coop_tile<pack_f32>(wp0, uint64_t(v) * w_step_u4));
+            S::storeB(s0 + v * (kRowStep * S::kStrideU4), load_coop_tile<pack_f32>(wp0, uint64_t(v) * w_step_u4 + first_u4));
         GroupMemoryBarrierWithGroupSync();
 
         for (uint kt = 0u; kt < num_k_tiles; ++kt) {
@@ -250,22 +262,26 @@ void coopmat_gemm_smem<TStorage : ICoopElement, TMat : ICoopElement, TAcc : ICoo
             [ForceUnroll] for (uint v = 0u; v < kVecB; ++v) pB[v] = uint4(0u);
             bool has_next = (kt + 1u < num_k_tiles);
             if (has_next) {
-                uint64_t k_u4 = uint64_t(kt + 1u) << 2u;
+                uint next_tile = kt + 1u + first_tile;
+                if (SHORT_W8A8 && next_tile >= num_k_tiles) next_tile -= num_k_tiles;
+                uint64_t k_u4 = uint64_t(next_tile) * kDepthU4;
                 [ForceUnroll] for (uint v = 0u; v < kVecA; ++v)
                     pA[v] = load_coop_tile<pack_f32>(xp0, uint64_t(v) * x_step_u4 + k_u4);
                 [ForceUnroll] for (uint v = 0u; v < kVecB; ++v)
                     pB[v] = load_coop_tile<pack_f32>(wp0, uint64_t(v) * w_step_u4 + k_u4);
             }
-            coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, 0u);
+            [ForceUnroll] for (uint offset = 0u; offset < kDepthU4 - 2u; offset += 2u) {
+                coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, offset);
+            }
             linalg::CoopMat<TMat, MemoryScope.Subgroup, 16, K_STEP, linalg::CoopMatMatrixUse.MatrixA> mA1[WARP_M];
             linalg::CoopMat<TMat, MemoryScope.Subgroup, K_STEP, 16, linalg::CoopMatMatrixUse.MatrixB> mB1[WARP_N];
-            coopmat_load_ab<TMat, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(mA1, mB1, wr, wc, 2u);
+            coopmat_load_ab<TMat, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(mA1, mB1, wr, wc, kDepthU4 - 2u);
             if (has_next) {
                 GroupMemoryBarrierWithGroupSync();
                 [ForceUnroll] for (uint v = 0u; v < kVecA; ++v)
-                    S::storeA(s0 + v * (kRowStep * kCmSmemStrideU4), pA[v]);
+                    S::storeA(s0 + v * (kRowStep * S::kStrideU4), pA[v]);
                 [ForceUnroll] for (uint v = 0u; v < kVecB; ++v)
-                    S::storeB(s0 + v * (kRowStep * kCmSmemStrideU4), pB[v]);
+                    S::storeB(s0 + v * (kRowStep * S::kStrideU4), pB[v]);
             }
             coopmat_fma<TMat, TAcc, K_STEP, WARP_M, WARP_N>(acc, mA1, mB1);
             if (has_next) {
@@ -277,17 +293,18 @@ void coopmat_gemm_smem<TStorage : ICoopElement, TMat : ICoopElement, TAcc : ICoo
             uint k0 = kt * bk_elems;
             [ForceUnroll] for (uint v = 0u; v < kVecA; ++v) {
                 uint lr = lr0 + v * kRowStep;
-                S::storeA(lr * kCmSmemStrideU4 + lu0,
+                S::storeA(lr * S::kStrideU4 + lu0,
                           load_u4_safe<ELEM_BYTES, pack_f32>(xb, row0 + lr, a.rows, k0 + lu0 * elems_per_u4, a.k, a.x_stride, aligned16));
             }
             [ForceUnroll] for (uint v = 0u; v < kVecB; ++v) {
                 uint lr = lr0 + v * kRowStep;
-                S::storeB(lr * kCmSmemStrideU4 + lu0,
+                S::storeB(lr * S::kStrideU4 + lu0,
                           load_u4_safe<ELEM_BYTES, pack_f32>(wb, col0 + lr, a.m, k0 + lu0 * elems_per_u4, a.k, a.w_stride, aligned16));
             }
             GroupMemoryBarrierWithGroupSync();
-            coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, 0u);
-            coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, 2u);
+            [ForceUnroll] for (uint offset = 0u; offset < kDepthU4; offset += 2u) {
+                coopmat_mma_step<TMat, TAcc, K_STEP, WG_M, WG_N, WARP_M, WARP_N, S>(acc, wr, wc, offset);
+            }
             GroupMemoryBarrierWithGroupSync();
         }
     }
@@ -355,4 +372,9 @@ void vk_gemm_coopmat_w8a8_64(uniform LinearArgs<int8_t, int8_t, float> a, uint3 
 [shader("compute")] [numthreads(128, 1, 1)]
 void vk_gemm_f32_as_f16(uniform LinearArgs<float, float, float> a, uint3 tid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     coopmat_gemm_smem<float, half, float, EpBias, 16, 2, 0, 64, 64, 2, 2, 128, CoopSmem64>(a, 0.0f, tid, gid);
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_gemm_short_w8a8(uniform LinearArgs<int8_t, int8_t, float> a, uint3 tid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    coopmat_gemm_smem<int8_t, int8_t, int32_t, EpQuantScale, 32, 1, 1, 64, 32, 1, 1, 256, CoopSmemShort, true>(a, 0, tid, gid);
 }

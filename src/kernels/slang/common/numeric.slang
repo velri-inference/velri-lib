@@ -9,6 +9,8 @@ public interface IElement {
     static float toF32(Storage v);
     static Storage fromF32(float x);
     static float4 load4F32(Ptr<Storage, Access.Read> p);
+    // CPU-only fast aligned load; caller must ensure `p` is aligned to `4 * sizeof(Storage)`.
+    static float4 load4F32Aligned(Ptr<Storage, Access.Read> p);
 }
 
 public struct ElemF32 : IElement {
@@ -18,6 +20,9 @@ public struct ElemF32 : IElement {
     public static float fromF32(float x) { return x; }
     public static float4 load4F32(Ptr<float, Access.Read> p) {
         return float4(p[0], p[1], p[2], p[3]);
+    }
+    public static float4 load4F32Aligned(Ptr<float, Access.Read> p) {
+        return Ptr<float4, Access.Read>(p)[0];
     }
 }
 
@@ -91,6 +96,9 @@ public struct ElemF16 : IElement {
     public static float4 load4F32(Ptr<uint16_t, Access.Read> p) {
         return float4(toF32(p[0]), toF32(p[1]), toF32(p[2]), toF32(p[3]));
     }
+    public static float4 load4F32Aligned(Ptr<uint16_t, Access.Read> p) {
+        return load4F32(p);
+    }
 }
 #else
 public struct ElemF16 : IElement {
@@ -101,6 +109,9 @@ public struct ElemF16 : IElement {
     public static float4 load4F32(Ptr<half, Access.Read> p) {
         half4 h = half4(p[0], p[1], p[2], p[3]);
         return float4(h);
+    }
+    public static float4 load4F32Aligned(Ptr<half, Access.Read> p) {
+        return float4(Ptr<half4, Access.Read>(p)[0]);
     }
 }
 #endif
@@ -122,6 +133,10 @@ public struct ElemBF16 : IElement {
         uint4 u = uint4(uint(p[0]), uint(p[1]), uint(p[2]), uint(p[3]));
         return asfloat(u << 16u);
     }
+    public static float4 load4F32Aligned(Ptr<uint16_t, Access.Read> p) {
+        vector<uint16_t, 4> h = Ptr<vector<uint16_t, 4>, Access.Read>(p)[0];
+        return asfloat(uint4(h) << 16u);
+    }
 }
 
 public struct ElemI8 : IElement {
@@ -132,6 +147,10 @@ public struct ElemI8 : IElement {
     public static float4 load4F32(Ptr<int8_t, Access.Read> p) {
         int4 v = int4(int(p[0]), int(p[1]), int(p[2]), int(p[3]));
         return float4(v);
+    }
+    public static float4 load4F32Aligned(Ptr<int8_t, Access.Read> p) {
+        vector<int8_t, 4> v = Ptr<vector<int8_t, 4>, Access.Read>(p)[0];
+        return float4(int4(v));
     }
 }
 

@@ -1,0 +1,39 @@
+# Velri-lib
+
+> Velri-lib (`VelriLib::velri`, v0.7.0) is a standalone C23 neural-network computation library providing zero-copy tensor views, liveness scratch memory planning, UMA-aware execution graphs, reusable transformer blocks, and modular Khronos Slang (`slangc`) ahead-of-time (AOT) compute kernels for CPU and Vulkan 1.3 / SPIR-V 1.6.
+
+## Canonical Facts
+
+- **API & implementation:** Public C23 umbrella header `<velri_lib/velri_lib.h>` (`C_STANDARD=23`, no C++ types across API); zero Python, PyTorch, CUDA, LLVM, or Slang runtime dependencies (`slangc` is build-time AOT only).
+- **CPU backend:** 23 Slang AOT MatOps kernels compiled from one shared source (`src/kernels/slang/`) via target-neutral LLVM IR + Clang (or host-object fallback for GCC) across x86-64 (`base`, `avx2`, `avx512` with VNNI), ARM64 (`aarch64`), and RISC-V 64 (`rv64gc` / `rv64gcv` RVV 1.0), dispatched over a persistent 1-to-1 core-pinned worker pool (`velri_pool`) with `0 B` hot-path heap allocations.
+- **Vulkan backend (`-DVELRI_ENABLE_VULKAN=ON`):** 29 modular `spirv-val`-verified SPIR-V 1.6 compute shaders (`src/kernels/slang/vk/`) supporting `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`, tiled FlashAttention, Split-KV decode, fused QKV+RoPE and gate/up+SiLU, DAG barrier elision, and async 8-slot fence rings.
+- **Cross-compilation targets:** Linux (x86-64, AArch64, RISC-V 64), Windows (x86-64, ARM64), Android (`arm64-v8a`, `x86_64`), and macOS.
+- **License:** GNU General Public License v3.0 (`GPL-3.0`).
+- **Author / Organization:** Vemloir / [velri-inference](https://github.com/velri-inference).
+
+## Measured Throughput (Verified)
+
+- **CPU (`bench_slang_cpu --workers 16`, AMD Ryzen 9 9950X, 16 physical cores, DDR5-6000):**
+  - `1024×4096×4096` GEMM: FP32 `4.019 TFLOPS`, FP16->FP32 `4.067 TFLOPS`, BF16->FP32 `4.197 TFLOPS`, F32×BF16 `4.156 TFLOPS` (`4.293 TFLOPS` at 256 rows), FP64 `2.022 TFLOPS` (`2.052` at 256 rows), W8A8 raw `17.152 TOPS`, W8A8 packed `17.866 TOPS` (`80.3%` of measured VNNI peak).
+  - Cold-DRAM single-token GEMV: `66.4–71.3 GB/s` across all 7 float and W8A8 modes.
+- **Vulkan (`decode64`, NVIDIA RTX 5070 Ti, GDDR7, TinyLlama-1.1B W8A8):**
+  - Full-session decode: `563.16 tok/s` (`113.64 ms` / 64 tokens); W8A8 projections reach `1.280 TOPS` weighted (`76.69%` of streaming ceiling) and `1.600 TOPS` (`95.84%`) on `32000×2048`.
+
+## Core Documentation
+
+- [Library Overview & Build Guide (README)](https://github.com/velri-inference/velri-lib/blob/main/README.md): CMake options, cross-compilation commands, benchmarks, and `find_package(VelriLib 0.7.0 EXACT)`.
+- [Velri-lib Architecture (EN)](https://github.com/velri-inference/velri-lib/blob/main/docs/EN/architecture.md): Three-layer design, `Storage`/`TensorView`, K/V input roles, operation graph, backend registry, and RAM transfer bus.
+- [Slang-First AOT Kernels (EN)](https://github.com/velri-inference/velri-lib/blob/main/docs/EN/kernels.md): Composable `IElement`/`IActivation`/`IEpilogue`/`IKVSource`, 5-loop BLIS CPU path, AVX-512 VNNI W8A8, Vulkan SPIR-V 1.6 / `CoopMat` / FlashAttention.
+- [Execution & Synchronization (EN)](https://github.com/velri-inference/velri-lib/blob/main/docs/EN/execution.md): `prepare`, UMA memory budgets, hybrid CPU+Vulkan execution, fence rings, cancellation.
+
+## Velri Ecosystem
+
+- [Velri Engine](https://github.com/velri-inference/velri): Full C23/C++23 LLM inference engine built on `Velri-lib`.
+- [VTQ Research](https://github.com/velri-inference/vtq-research): Velri Trellis Quant (`.vtq` v2) weight quantization format and benchmarks.
+- [Velri Hub](https://velri-inference.github.io/): Unified website and full ecosystem LLM brief ([llms-full.txt](https://velri-inference.github.io/llms-full.txt)).
+
+## Optional (Russian Documentation)
+
+- [Архитектура Velri-lib (RU)](https://github.com/velri-inference/velri-lib/blob/main/docs/RU/architecture.md)
+- [Кернелы на Slang (RU)](https://github.com/velri-inference/velri-lib/blob/main/docs/RU/kernels.md)
+- [Исполнение и синхронизация (RU)](https://github.com/velri-inference/velri-lib/blob/main/docs/RU/execution.md)
